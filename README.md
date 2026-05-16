@@ -80,7 +80,7 @@ Every device runs the same daemon. The scheduler decides where each task goes. M
 ### Install
 
 ```bash
-git clone https://github.com/aries-mesh/ariesmesh.git)
+git clone https://github.com/aries-mesh/ariesmesh.git
 cd aries-mesh
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\Activate.ps1
