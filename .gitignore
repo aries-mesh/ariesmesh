@@ -1,0 +1,58 @@
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+sdist/
+wheels/
+
+# Testing and linting caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Aries-specific sensitive files — NEVER commit
+# Aries user data directory (contains keys, household state, memory)
+.aries/
+
+# Device key files (Ed25519 private keys, may be Argon2id-encrypted)
+device_key.json
+
+# Shamir secret shares of the root key
+*.bin
+
+# Household state and memory persistence
+household.json
+memory.json
+
+# Mandate config (may contain user-specific policies)
+mandates.yaml
+
+# IDE and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Miscellaneous
+.env
+.env.local
+.env.*.local
+*.log
+node_modules/
