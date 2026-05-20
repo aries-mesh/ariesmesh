@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT">
   <img src="https://img.shields.io/badge/Python-3.11%2B-blue.svg" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/Tests-82%20passing-brightgreen.svg" alt="Tests: 82 passing">
-  <img src="https://img.shields.io/badge/Version-0.1.1-orange.svg" alt="Version: 0.2.0">
+  <img src="https://img.shields.io/badge/Version-0.2.0-orange.svg" alt="Version: 0.2.0">
 </p>
 
 ---
