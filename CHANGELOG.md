@@ -5,7 +5,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [v0.1.1] — 2026-05-15 — Security hardening
+## [v0.1.1] — Security hardening
 
 Five trust-critical gaps surfaced by a v0.1 review, all fixed and pinned by adversarial tests.
 
@@ -22,7 +22,7 @@ Plus five new adversarial tests in `tests/test_security.py`:
 
 ---
 
-## [v0.1.0] — 2026-04-10 — Initial prototype
+## [v0.1.0] — Initial prototype
 
 The end-to-end build 
 

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
-from pathlib import Path
 
 import pytest
 
@@ -16,7 +15,6 @@ from aries.adapters.base import Message
 from aries.adapters.mock_adapter import MockAdapter
 from aries.continuation import HandoffReason
 from aries.node import AriesNode
-from aries.scheduler.router import Locality
 
 
 async def _wire(a: AriesNode, b: AriesNode) -> None:
@@ -101,8 +99,8 @@ async def test_pairing_and_memory_sync() -> None:
 
         await _pair_via_household_clone(node_a, node_b)
 
-        await node_a.start(enable_discovery=False, enable_profiler=False)
-        await node_b.start(enable_discovery=False, enable_profiler=False)
+        await node_a.start(enable_discovery=False, enable_profiler=False, enable_api=False)
+        await node_b.start(enable_discovery=False, enable_profiler=False, enable_api=False)
 
         await _wire(node_a, node_b)
 
@@ -136,8 +134,8 @@ async def test_handoff_auto_resume() -> None:
         node_b.household = Household(data_dir=tmp_b)
         await _pair_via_household_clone(node_a, node_b)
 
-        await node_a.start(enable_discovery=False, enable_profiler=False)
-        await node_b.start(enable_discovery=False, enable_profiler=False)
+        await node_a.start(enable_discovery=False, enable_profiler=False, enable_api=False)
+        await node_b.start(enable_discovery=False, enable_profiler=False, enable_api=False)
         await _wire(node_a, node_b)
 
         # B is the "private" device that can run a mock locally

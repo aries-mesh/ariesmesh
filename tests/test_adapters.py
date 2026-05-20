@@ -1,13 +1,11 @@
 """Unit tests for adapters: vendor inference, capabilities, mock invocation."""
 from __future__ import annotations
 
-import asyncio
 
 import pytest
 
 from aries.adapters.base import InvokeRequest, InvokeResponse, Message
 from aries.adapters.litellm_adapter import (
-    LiteLLMAdapter,
     _infer_vendor,
     anthropic_adapter,
     google_adapter,

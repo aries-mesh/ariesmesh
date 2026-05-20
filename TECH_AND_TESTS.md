@@ -230,4 +230,4 @@ aries --data-dir $env:TEMP\aries-demo invoke -m "hello" --locality local-only
 
 ---
 
-*Last refresh: 2026-05-15 (v0.1.1 hardening pass). All 46 tests green under Windows 11, Python 3.14.3, no Ollama or API key required.*
+*v0.1.1 hardening pass. All 46 tests green under Windows 11, Python 3.14.3, no Ollama or API key required.*

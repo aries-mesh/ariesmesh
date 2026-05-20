@@ -4,11 +4,13 @@ __pycache__/
 *.pyo
 *.egg-info/
 *.egg
-dist/
-build/
-.eggs/
-sdist/
-wheels/
+# Anchored to repo root so they don't match `src/aries/dashboard/dist/`,
+# which is committed package data (built React dashboard).
+/dist/
+/build/
+/.eggs/
+/sdist/
+/wheels/
 
 # Testing and linting caches
 .pytest_cache/

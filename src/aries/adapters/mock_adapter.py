@@ -1,7 +1,6 @@
 """MockAdapter — deterministic, offline adapter for unit tests and demos."""
 from __future__ import annotations
 
-import time
 from typing import Any, AsyncIterator, Optional
 
 from .base import BaseAdapter, InvokeRequest, InvokeResponse

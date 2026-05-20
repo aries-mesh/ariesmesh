@@ -8,7 +8,7 @@ import asyncio
 from typing import Any, Optional
 
 from ..transport.peer import AriesMessage, MessageTypes, PeerConnection, TransportServer
-from .store import LWWEntry, MemoryStore
+from .store import MemoryStore
 
 
 SYNC_DEBOUNCE_MS = 100

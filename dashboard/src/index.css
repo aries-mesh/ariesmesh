@@ -1,0 +1,149 @@
+@import "tailwindcss";
+
+@theme {
+  --color-aries-indigo: #1B2A4A;
+  --color-aries-teal: #00D4AA;
+  --color-aries-amber: #E67E22;
+  --color-aries-dark: #0F1923;
+  --color-aries-surface: #162235;
+  --color-aries-surface-hi: #1B2A40;
+  --color-aries-border: #1E3450;
+  --color-aries-text: #C8D6E5;
+  --color-aries-text-dim: #6B7F99;
+  --color-aries-success: #00D4AA;
+  --color-aries-warning: #E67E22;
+  --color-aries-error: #EF4D5E;
+
+  --font-display: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+
+  --radius-card: 14px;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-aries-dark);
+  color: var(--color-aries-text);
+  font-family: var(--font-display);
+  font-feature-settings: "ss01", "cv11";
+  letter-spacing: -0.005em;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Subtle radial backdrop so the dark surface doesn't feel flat. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background:
+    radial-gradient(900px 600px at 20% 0%, rgba(0, 212, 170, 0.06), transparent 60%),
+    radial-gradient(700px 500px at 100% 100%, rgba(230, 126, 34, 0.04), transparent 60%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+#root {
+  position: relative;
+  z-index: 1;
+}
+
+/* Scrollbar — keep the dark, low-contrast tone */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #1E3450;
+  border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #2A4566;
+}
+
+/* Pulse animation for live status dots */
+@keyframes aries-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.55; transform: scale(0.92); }
+}
+.aries-pulse {
+  animation: aries-pulse 2.2s ease-in-out infinite;
+}
+
+/* Slide-in animation for new event cards */
+@keyframes aries-slide-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.aries-slide-in {
+  animation: aries-slide-in 240ms ease-out;
+}
+
+/* Faint sweeping glow used on the active-inference card */
+@keyframes aries-shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.aries-shimmer {
+  background: linear-gradient(
+    90deg,
+    rgba(0, 212, 170, 0) 0%,
+    rgba(0, 212, 170, 0.15) 50%,
+    rgba(0, 212, 170, 0) 100%
+  );
+  background-size: 200% 100%;
+  animation: aries-shimmer 2.4s linear infinite;
+}
+
+/* Halo glow used on the current device's topology node */
+@keyframes aries-halo-pulse {
+  0%, 100% {
+    box-shadow:
+      0 0 0 0 rgba(0, 212, 170, 0.55),
+      0 0 22px 4px rgba(0, 212, 170, 0.22),
+      inset 0 0 18px 0 rgba(0, 212, 170, 0.15);
+  }
+  50% {
+    box-shadow:
+      0 0 0 10px rgba(0, 212, 170, 0.0),
+      0 0 38px 10px rgba(0, 212, 170, 0.32),
+      inset 0 0 22px 0 rgba(0, 212, 170, 0.22);
+  }
+}
+.aries-halo {
+  animation: aries-halo-pulse 2.6s ease-in-out infinite;
+}
+
+/* Slow rotating ring used as the outer accent on the host node */
+@keyframes aries-ring-spin {
+  to { transform: rotate(360deg); }
+}
+.aries-ring {
+  animation: aries-ring-spin 18s linear infinite;
+}
+
+/* Subtle fade-in for the tooltip */
+@keyframes aries-tooltip-in {
+  from { opacity: 0; transform: translate(-50%, calc(100% + 4px)); }
+  to   { opacity: 1; transform: translate(-50%, calc(100% + 12px)); }
+}
+.aries-tooltip {
+  animation: aries-tooltip-in 160ms ease-out forwards;
+}
+
+/* Edge line shimmer for the connecting lines */
+@keyframes aries-edge-flow {
+  0%   { stroke-dashoffset: 0; }
+  100% { stroke-dashoffset: -24; }
+}
+.aries-edge {
+  stroke-dasharray: 6 6;
+  animation: aries-edge-flow 1.6s linear infinite;
+}

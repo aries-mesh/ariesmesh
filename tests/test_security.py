@@ -9,7 +9,6 @@ Pins behavior on the nasty paths the v0.1 happy-path coverage missed:
 """
 from __future__ import annotations
 
-import asyncio
 import tempfile
 
 import pytest
@@ -18,7 +17,6 @@ from nacl.exceptions import CryptoError
 from aries.adapters.base import Message
 from aries.continuation import HandoffReason, build_continuation
 from aries.identity.did import public_key_to_did
-from aries.identity.household import Household
 from aries.identity.keys import KeyPair, load_keypair, save_keypair
 from aries.identity.ucan import (
     Capability,
@@ -69,7 +67,7 @@ async def test_handoff_without_target_raises() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         node = AriesNode(data_dir=tmp)
         await node.initialize("solo", "linux")
-        await node.start(enable_discovery=False, enable_profiler=False)
+        await node.start(enable_discovery=False, enable_profiler=False, enable_api=False)
         try:
             with pytest.raises(ValueError, match="target_device_did"):
                 # The type hint says str; pass empty to simulate the v0.1 default behavior

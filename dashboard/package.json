@@ -1,0 +1,24 @@
+{
+  "name": "aries-dashboard",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "description": "Web dashboard for the Aries Mesh node — mission control for your personal compute fabric.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-router-dom": "^7.0.0",
+    "lucide-react": "^0.469.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.4.0",
+    "@tailwindcss/vite": "^4.0.0",
+    "tailwindcss": "^4.0.0",
+    "vite": "^6.0.0"
+  }
+}

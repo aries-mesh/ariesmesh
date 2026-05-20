@@ -1,10 +1,19 @@
 """Wire-level message envelope, TCP peer connections, and transport server.
 
 Spec reference: §8. Plus pairing message types per plan.
+
+Wire format (v0.2+):
+  Handshake phase: [4-byte length][0x00][Noise handshake payload]
+  Application phase: [4-byte length][0x01][Noise-encrypted CBOR payload]
+
+When TransportServer is constructed without a device_keypair, encryption is
+skipped and messages are exchanged as plain CBOR — used in unit tests that
+construct the transport layer directly without a household.
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 import struct
 import time
 import uuid
@@ -12,6 +21,10 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
 import cbor2
+
+from .crypto import HandshakeError, NoiseSession, _APP_BYTE
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -37,6 +50,14 @@ class MessageTypes:
     PAIRING_OFFER = "aries/v0.1/pairing/offer"
     PAIRING_REQUEST = "aries/v0.1/pairing/request"
     PAIRING_ACCEPT = "aries/v0.1/pairing/accept"
+
+    # Distributed inference (v0.2)
+    INFERENCE_SETUP = "aries/v0.2/inference/setup"
+    INFERENCE_READY = "aries/v0.2/inference/ready"
+    INFERENCE_TEARDOWN = "aries/v0.2/inference/teardown"
+    INFERENCE_PROBE = "aries/v0.2/inference/probe"
+    INFERENCE_PROBE_RESPONSE = "aries/v0.2/inference/probe_response"
+    STREAM_CHUNK = "aries/v0.2/stream/chunk"
 
 
 # Maximum message size (sanity limit)
@@ -130,10 +151,23 @@ class PeerConnection:
         self._seq = 0
         self._connected = True
         self._send_lock = asyncio.Lock()
+        self._noise: Optional[NoiseSession] = None
+        self._encrypted = False
 
     @property
     def is_connected(self) -> bool:
         return self._connected
+
+    async def perform_handshake(self, device_keypair: Any, is_initiator: bool) -> bytes:
+        """Run Noise_XX handshake immediately after TCP connect.
+
+        Must be called before any AriesMessage send/recv. Returns the remote
+        peer's X25519 static public key bytes. Raises HandshakeError on failure.
+        """
+        self._noise = NoiseSession(device_keypair, is_initiator)
+        remote_static = await self._noise.handshake(self.reader, self.writer)
+        self._encrypted = True
+        return remote_static
 
     async def send(self, msg: AriesMessage) -> None:
         if not self._connected:
@@ -141,7 +175,14 @@ class PeerConnection:
         async with self._send_lock:
             self._seq += 1
             msg.seq = self._seq
-            self.writer.write(msg.to_bytes())
+            cbor_payload = msg.to_cbor()
+            if self._encrypted and self._noise is not None:
+                ciphertext = self._noise.encrypt(cbor_payload)
+                # [4-byte length][0x01 type][ciphertext]
+                frame = struct.pack("!I", len(ciphertext) + 1) + _APP_BYTE + ciphertext
+            else:
+                frame = msg.to_bytes()
+            self.writer.write(frame)
             await self.writer.drain()
 
     async def recv(self) -> Optional[AriesMessage]:
@@ -152,6 +193,9 @@ class PeerConnection:
                 self._connected = False
                 raise ValueError(f"Message size {length} exceeds {MAX_MESSAGE_SIZE}")
             payload = await self.reader.readexactly(length)
+            if self._encrypted and self._noise is not None and payload and payload[0:1] == _APP_BYTE:
+                plaintext = self._noise.decrypt(payload[1:])
+                return AriesMessage.from_cbor(plaintext)
             return AriesMessage.from_cbor(payload)
         except (asyncio.IncompleteReadError, ConnectionError, OSError):
             self._connected = False
@@ -171,13 +215,19 @@ class PeerConnection:
 # ---------------------------------------------------------------------------
 
 class TransportServer:
-    def __init__(self, host: str = "0.0.0.0", port: int = 0) -> None:
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 0,
+        device_keypair: Optional[Any] = None,
+    ) -> None:
         self.host = host
         self.port = port
         self._server: Optional[asyncio.Server] = None
         self._handlers: dict[str, MessageHandler] = {}
         self._connections: dict[str, PeerConnection] = {}
         self._recv_tasks: set[asyncio.Task[None]] = set()
+        self._device_keypair = device_keypair
 
     def on_message(self, msg_type: str, handler: MessageHandler) -> None:
         self._handlers[msg_type] = handler
@@ -209,6 +259,13 @@ class TransportServer:
     async def connect_to_peer(self, peer: PeerInfo) -> PeerConnection:
         reader, writer = await asyncio.open_connection(peer.host, peer.port)
         conn = PeerConnection(peer, reader, writer)
+        if self._device_keypair is not None:
+            try:
+                await conn.perform_handshake(self._device_keypair, is_initiator=True)
+                logger.debug("Encrypted session established with %s", peer.name or peer.device_did[:16])
+            except HandshakeError as exc:
+                await conn.close()
+                raise ConnectionError(f"Noise handshake failed with {peer.name}: {exc}") from exc
         if peer.device_did:
             self._connections[peer.device_did] = conn
         task = asyncio.create_task(self._receive_loop(conn))
@@ -243,6 +300,19 @@ class TransportServer:
         except Exception:
             pass
         conn = PeerConnection(peerinfo, reader, writer)
+        if self._device_keypair is not None:
+            try:
+                await conn.perform_handshake(self._device_keypair, is_initiator=False)
+                logger.debug("Incoming encrypted session from %s", peerinfo.host)
+            except HandshakeError as exc:
+                logger.warning(
+                    "Noise handshake failed from %s: %s — "
+                    "peer may be running a plaintext-only version of Aries Mesh",
+                    peerinfo.host,
+                    exc,
+                )
+                await conn.close()
+                return
         await self._receive_loop(conn)
 
     async def _receive_loop(self, conn: PeerConnection) -> None:

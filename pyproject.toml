@@ -19,17 +19,26 @@ dependencies = [
     "websockets>=12.0",
     "blake3>=0.4.0",
     "pyyaml>=6.0",
+    "noiseprotocol>=0.3.1",
+    "aiohttp>=3.9.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4.0"]
 semantic = ["sentence-transformers>=3.0.0", "numpy>=1.26.0"]
+inference = ["llama-cpp-python>=0.3.0"]
 
 [project.scripts]
 aries = "aries.cli.main:cli"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["aries*"]
+
+[tool.setuptools.package-data]
+# Ship the built React dashboard inside the wheel so end users never need
+# Node/npm. The artifacts live in src/aries/dashboard/dist/ and are committed.
+"aries.dashboard" = ["dist/**/*"]
 
 [tool.ruff]
 line-length = 100

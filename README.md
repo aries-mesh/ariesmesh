@@ -9,7 +9,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT">
   <img src="https://img.shields.io/badge/Python-3.11%2B-blue.svg" alt="Python 3.11+">
-  <img src="https://img.shields.io/badge/Tests-46%20passing-brightgreen.svg" alt="Tests: 46 passing">
+  <img src="https://img.shields.io/badge/Tests-82%20passing-brightgreen.svg" alt="Tests: 82 passing">
   <img src="https://img.shields.io/badge/Version-0.1.1-orange.svg" alt="Version: 0.1.1">
 </p>
 
@@ -25,66 +25,127 @@ It sits beneath agent frameworks and model providers as the infrastructure layer
 
 ## What works today
 
-- Household initialization with Shamir 2-of-3 root key splitting
-- Device pairing via 6-word BIP39 codes over mDNS
-- Agent registration for any LLM provider through litellm (Ollama, Anthropic, OpenAI, Google, any OpenAI-compatible endpoint)
-- Privacy-first task routing — four-stage scheduler: Filter, Mandate, Score, Select
-- User-defined mandates (tag-based, time-based, default) via YAML config
-- CRDT-backed shared memory with three namespaces: context://, memory://, cache://
-- Two-phase memory sync across devices (100ms debounce + 30s periodic)
+**Identity & trust**
+- Household initialization with Shamir 2-of-3 root key splitting and Ed25519 device keys
+- Device pairing via 6-word BIP39 codes over mDNS, gated by a UCAN membership token
+- UCAN 1.0 capability tokens with delegation chains and `/*` glob attenuation
+- Revocation list propagated to every peer — one device can disable a compromised sibling in seconds
+- Key files encrypted at rest with Argon2id-derived keys + XSalsa20-Poly1305 SecretBox (optional passphrase)
+
+**Encrypted transport**
+- Every byte between nodes flows through a Noise_XX session (X25519 ECDH + ChaCha20-Poly1305 AEAD, per-session ephemeral forward secrecy)
+- CBOR-framed `AriesMessage` envelopes over TCP, mDNS peer discovery via zeroconf
 - Signed Continuation envelopes for cross-device task hand-off
 - Hash-linked Ed25519-signed receipt chains for audit trails
-- UCAN 1.0 capability-based authorization with delegation chains and glob attenuation
-- Argon2id + SecretBox encrypted key storage
-- Full CLI: init, start, pair, register, invoke, handoff, status, agents, memory, household
-- 46 tests passing — zero external API keys required
+
+**Scheduling**
+- Four-stage router: Filter → Mandate → Score → Select across five weighted dimensions (privacy 3.0, capability 2.0, latency 1.5, cost 1.0, health 1.0)
+- User-defined mandates (tag-based, time-based, default) via `~/.aries/mandates.yaml`
+- Live `DeviceProfiler` snapshots (CPU, RAM, battery, thermal, network) feeding the health dimension
+
+**Shared memory**
+- CRDT-backed store: LWW-Register with Lamport clocks + DID tie-break, deduplicated append-only logs
+- Three namespaces with TTLs: `aries:context://` (24 h), `aries:memory://` (no expiry), `aries:cache://` (1 h)
+- Two-phase sync across the encrypted transport (100 ms debounce + 30 s periodic)
+- UCAN-scoped write ACL: an agent with `aries:context://tasks/abc/*` cannot touch a sibling task's keys
+
+**Distributed inference (Feature 2)**
+- llama.cpp RPC orchestration: scheduler scores "local 7B" / "distributed 70B across two devices" / "cloud Claude" against each other
+- Capability probe finds local llama-server / rpc-server binaries, GGUF files, GPU backend (Metal / CUDA / Vulkan / CPU)
+- `InferenceCoordinator` brings rpc-server workers up over the encrypted transport, streams tokens via httpx
+- Adapters: `LiteLLMAdapter` (100+ providers) + `MockAdapter` for offline tests/demos
+
+**Streaming + UX**
+- `aries invoke -m "..." --stream` prints tokens as they arrive
+- `aries start` launches a Rich-Live terminal dashboard (peers, agents, memory, inference, activity)
+- Web dashboard at `http://localhost:7272` — React + Tailwind, served by an aiohttp server bundled in the daemon. SSE stream for live events.
+
+**CLI**
+- `init`, `start`, `pair`, `register`, `agents`, `invoke`, `handoff`, `resume`, `status`, `memory`, `household`, `mandate`, `inference {status,run,benchmark}`
+
+**Distribution**
+- Standalone binaries for Linux / macOS (Apple Silicon) / Windows via PyInstaller — one-line install (`curl | sh` or `irm | iex`), no Python required
+- React dashboard is bundled inside the wheel + binary; end users never run `npm`
+
+**Quality**
+- 82 tests passing — identity, memory, scheduler, adapters, two-node integration, security, encrypted transport, distributed inference, streaming, dashboard, ACL, API
+- Zero external API keys required to run the suite
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────┐     ┌─────────────────────┐     ┌─────────────────────┐
-│   MacBook Pro       │     │   Linux Desktop     │     │   Android Phone     │
-│                     │     │                     │     │                     │
-│  ┌───────────────┐  │     │  ┌───────────────┐  │     │  ┌───────────────┐  │
-│  │ Shared Memory │  │     │  │ Shared Memory │  │     │  │ Shared Memory │  │
-│  │ (CRDT Sync)   │  │     │  │ (CRDT Sync)   │  │     │  │ (CRDT Sync)   │  │
-│  ├───────────────┤  │     │  ├───────────────┤  │     │  ├───────────────┤  │
-│  │  Scheduler    │  │     │  │  Scheduler    │  │     │  │  Scheduler    │  │
-│  ├───────────────┤  │     │  ├───────────────┤  │     │  ├───────────────┤  │
-│  │  Transport +  │  │     │  │  Transport +  │  │     │  │  Transport +  │  │
-│  │  Identity     │  │     │  │  Identity     │  │     │  │  Identity     │  │
-│  ├───────────────┤  │     │  ├───────────────┤  │     │  ├───────────────┤  │
-│  │ Node Runtime  │  │     │  │ Node Runtime  │  │     │  │ Node Runtime  │  │
-│  │ + Adapters    │  │     │  │ + Adapters    │  │     │  │ + Adapters    │  │
-│  └───────────────┘  │     │  └───────────────┘  │     │  └───────────────┘  │
-└──────────┬──────────┘     └──────────┬──────────┘     └──────────┬──────────┘
-           │          CBOR/TCP + mDNS  │                           │
-           └───────────────────────────┴───────────────────────────┘
+┌──────────────────────┐    ┌──────────────────────┐    ┌──────────────────────┐
+│   MacBook Pro        │    │   Linux Desktop      │    │   Android (Termux)   │
+│ ─────────────────    │    │ ─────────────────    │    │ ─────────────────    │
+│  CLI · TUI · Web UI  │    │  CLI · TUI · Web UI  │    │  CLI · TUI · Web UI  │
+│  ─ aiohttp :7272 ─   │    │  ─ aiohttp :7272 ─   │    │  ─ aiohttp :7272 ─   │
+│  ┌────────────────┐  │    │  ┌────────────────┐  │    │  ┌────────────────┐  │
+│  │ Shared Memory  │  │    │  │ Shared Memory  │  │    │  │ Shared Memory  │  │
+│  │ CRDT · ACL     │  │    │  │ CRDT · ACL     │  │    │  │ CRDT · ACL     │  │
+│  ├────────────────┤  │    │  ├────────────────┤  │    │  ├────────────────┤  │
+│  │  Scheduler +   │  │    │  │  Scheduler +   │  │    │  │  Scheduler +   │  │
+│  │  Inference Reg │  │    │  │  Inference Reg │  │    │  │  Inference Reg │  │
+│  ├────────────────┤  │    │  ├────────────────┤  │    │  ├────────────────┤  │
+│  │  Transport +   │  │    │  │  Transport +   │  │    │  │  Transport +   │  │
+│  │  Identity      │  │    │  │  Identity      │  │    │  │  Identity      │  │
+│  ├────────────────┤  │    │  ├────────────────┤  │    │  ├────────────────┤  │
+│  │  Node Runtime  │  │    │  │  Node Runtime  │  │    │  │  Node Runtime  │  │
+│  │  + Adapters    │  │    │  │  + Adapters    │  │    │  │  + Adapters    │  │
+│  └────────────────┘  │    │  └────────────────┘  │    │  └────────────────┘  │
+└──────────┬───────────┘    └──────────┬───────────┘    └──────────┬───────────┘
+           │     Noise_XX-encrypted CBOR over TCP · mDNS discovery │
+           └───────────────────────────────────────────────────────┘
 ```
 
-Every device runs the same daemon. The scheduler decides where each task goes. Memory syncs automatically.
+Every device runs the same daemon. The scheduler decides where each task goes. Memory syncs automatically. All inter-device traffic is encrypted at the session level — a packet capture on the LAN sees ciphertext only.
 
 | Layer | Responsibility | Key Modules |
 |-------|---------------|-------------|
-| Layer 3 — Shared Memory | CRDT-backed distributed state, three namespaces, two-phase sync | `memory/store.py`, `memory/sync.py` |
-| Layer 2 — Scheduler | Capability-aware routing, privacy scoring, user mandates | `scheduler/router.py`, `scheduler/profile.py` |
-| Layer 1 — Transport + Identity | DID-based identity, UCAN delegation, mDNS discovery, CBOR messaging | `identity/`, `transport/` |
-| Layer 0 — Node Runtime | Per-device daemon, vendor adapters, hardware profiling | `node.py`, `adapters/` |
+| Surfaces | CLI (`aries …`), Rich-Live terminal dashboard, React web dashboard on `http://localhost:7272` | `cli/main.py`, `cli/dashboard.py`, `api/server.py`, `dashboard/` |
+| Layer 3 — Shared Memory | CRDT (LWW + AppendLog), three namespaces, two-phase sync, UCAN-scoped write ACL | `memory/store.py`, `memory/sync.py` |
+| Layer 2 — Scheduler + Inference | 4-stage router (Filter→Mandate→Score→Select), distributed-inference registry + coordinator | `scheduler/router.py`, `scheduler/profile.py`, `inference/` |
+| Layer 1 — Transport + Identity | Noise_XX-encrypted CBOR transport, mDNS discovery, Ed25519 + Shamir + UCAN delegation chains | `transport/`, `identity/` |
+| Layer 0 — Node Runtime | Per-device daemon orchestrating all layers, vendor adapters (`LiteLLMAdapter` / `MockAdapter`), hardware profiler | `node.py`, `adapters/` |
 
 ---
 
 ## Quickstart
 
-### Install
+### Install (recommended)
+
+**macOS / Linux:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/aries-mesh/ariesmesh/main/install.sh | sh
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/aries-mesh/ariesmesh/main/install.ps1 | iex
+```
+
+No Python, no pip, no npm. A single self-contained binary lands at `/usr/local/bin/aries` (POSIX) or `%LOCALAPPDATA%\aries\aries.exe` (Windows). The dashboard is bundled inside — visit `http://localhost:7272` after `aries start`.
+
+### Install from source (contributors)
 
 ```bash
 git clone https://github.com/aries-mesh/ariesmesh.git
-cd aries-mesh
+cd ariesmesh
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
+pytest -q                  # 82 tests passing
+```
+
+To rebuild the web dashboard from source:
+
+```bash
+cd dashboard
+npm install
+npm run build              # outputs to src/aries/dashboard/dist/
 ```
 
 ### Initialize and start
@@ -175,27 +236,47 @@ aries-mesh/
 │   │   └── household.py           # Household state, pairing, agent registration
 │   ├── transport/
 │   │   ├── peer.py                # CBOR wire protocol, TCP connections
+│   │   ├── crypto.py              # Noise_XX handshake + AEAD session
 │   │   └── discovery.py           # mDNS service advertisement and browsing
 │   ├── scheduler/
 │   │   ├── router.py              # Four-stage routing pipeline, mandates
 │   │   └── profile.py             # Hardware profiler (psutil)
 │   ├── memory/
-│   │   ├── store.py               # LWW-Register + AppendLog CRDTs, three namespaces
+│   │   ├── store.py               # LWW-Register + AppendLog CRDTs, three namespaces, UCAN ACL
 │   │   └── sync.py                # Two-phase sync protocol
+│   ├── inference/
+│   │   ├── registry.py            # Catalog of feasible inference configs (local/distributed/cloud)
+│   │   ├── capability.py          # Probe llama.cpp binaries, GGUF files, GPU backend
+│   │   ├── coordinator.py         # Lifecycle of a distributed-inference session
+│   │   └── streaming.py           # llama-server SSE → STREAM_CHUNK forwarder
 │   ├── adapters/
 │   │   ├── base.py                # Abstract adapter interface
 │   │   ├── litellm_adapter.py     # Universal LLM adapter (100+ providers)
 │   │   └── mock_adapter.py        # Deterministic offline adapter for testing
+│   ├── api/
+│   │   └── server.py              # aiohttp JSON + SSE API for the web dashboard
+│   ├── dashboard/
+│   │   └── dist/                  # Bundled React build (committed; served by api/server.py)
 │   └── cli/
-│       └── main.py                # CLI entry point
-├── tests/                         # 46 tests (unit + integration + security)
+│       ├── main.py                # CLI entry point
+│       └── dashboard.py           # Rich-Live terminal dashboard
+├── dashboard/                     # React + Tailwind source (devs only)
+│   ├── src/                       # main.jsx, App.jsx, pages/, components/, hooks/
+│   └── vite.config.js
+├── tests/                         # 82 tests (unit + integration + security + API)
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   ├── ENGINEERING_SPEC.md
 │   ├── DEVELOPER_GUIDE.md
 │   ├── TECH_STACK.md
+│   ├── THREAT_MODEL.md
 │   └── research/
 │       └── distributed-inference-survey.md
+├── .github/workflows/
+│   ├── ci.yml                     # pytest + ruff on every push/PR
+│   └── release.yml                # PyInstaller binary build on v* tags
+├── install.sh                     # macOS / Linux one-liner installer
+├── install.ps1                    # Windows PowerShell installer
 └── pyproject.toml
 ```
 
@@ -223,13 +304,15 @@ aries-mesh/
 - [Engineering Specification](docs/ENGINEERING_SPEC.md)
 - [Developer Guide](docs/DEVELOPER_GUIDE.md)
 - [Tech Stack & Test Inventory](docs/TECH_STACK.md)
+- [Threat Model](docs/THREAT_MODEL.md)
+- [Security Policy](SECURITY.md)
 - [Distributed Inference Research Survey](docs/research/distributed-inference-survey.md)
 
 ---
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines. Run `pip install -e '.[dev]'` then `pytest` to verify all 46 tests pass. Open an issue before sending a PR.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines. Run `pip install -e '.[dev]'` then `pytest` to verify all 82 tests pass. Open an issue before sending a PR.
 
 ---
 

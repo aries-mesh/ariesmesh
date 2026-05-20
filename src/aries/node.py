@@ -18,13 +18,16 @@ import hashlib
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 
 from .adapters.base import BaseAdapter, InvokeRequest, InvokeResponse, Message
+from .api.server import DashboardAPI
 from .continuation import Continuation, HandoffReason, build_continuation
-from .identity.did import did_to_public_key
 from .identity.household import AgentRecord, Household
 from .identity.keys import KeyPair
+from .inference.capability import _PENDING_PROBES, probe_inference_capability
+from .inference.coordinator import InferenceCoordinator
+from .inference.registry import DeviceCapability, InferenceConfig, InferenceRegistry
 from .memory.store import MemoryStore
 from .memory.sync import MemorySyncService
 from .receipt import Receipt, ReceiptChain
@@ -57,6 +60,22 @@ class AriesNode:
         self._receipt_chains: dict[str, ReceiptChain] = {}
         self._started = False
 
+        # Distributed inference state (Feature 2).
+        self._inference_registry: Optional[InferenceRegistry] = None
+        self._inference_coordinator: Optional[InferenceCoordinator] = None
+        self._inference_ready_futures: dict[str, asyncio.Future[bool]] = {}
+        self._inference_rpc_processes: dict[str, "asyncio.subprocess.Process"] = {}
+        self._local_inference_capability: Optional[DeviceCapability] = None
+
+        # Live dashboard (Phase 4). Set by `aries start` when the dashboard
+        # is active; left as None otherwise.
+        self._dashboard: Optional[Any] = None
+        self._start_time: float = 0.0
+
+        # Web dashboard HTTP/SSE API (Phase 5). Auto-started in start();
+        # left as None if the port is busy or binding fails.
+        self._api: Optional[DashboardAPI] = None
+
     # -----------------------------------------------------------------------
     # init / load
     # -----------------------------------------------------------------------
@@ -65,7 +84,15 @@ class AriesNode:
         self.household = Household(data_dir=self.data_dir)
         return self.household.initialize(device_name=device_name, platform=platform)
 
-    async def start(self, *, enable_discovery: bool = True, enable_profiler: bool = True) -> None:
+    async def start(
+        self,
+        *,
+        enable_discovery: bool = True,
+        enable_profiler: bool = True,
+        enable_api: bool = True,
+        api_host: str = "127.0.0.1",
+        api_port: int = 7272,
+    ) -> None:
         """Bring up transport, scheduler, memory + (optionally) discovery and profiler.
 
         Pass `enable_discovery=False` / `enable_profiler=False` in tests or when
@@ -74,14 +101,15 @@ class AriesNode:
         if self._started:
             return
         self._started = True
+        self._start_time = time.time()
         if self.household is None:
             self.household = Household(data_dir=self.data_dir)
         if not self.household.is_initialized:
             raise RuntimeError(f"Household at {self.data_dir} not initialized; run `aries init` first")
         self.household.load()
 
-        # transport
-        self.transport = TransportServer()
+        # transport — pass device keypair so all connections are Noise_XX encrypted
+        self.transport = TransportServer(device_keypair=self.household._device_key)
         port = await self.transport.start()
         self.transport.on_message(MessageTypes.INVOKE, self._handle_invoke)
         self.transport.on_message(MessageTypes.CONTINUATION, self._handle_continuation)
@@ -128,14 +156,50 @@ class AriesNode:
         )
         await self.sync.start()
 
+        # Inference registry: probe local capability, register message handlers.
+        self._inference_registry = InferenceRegistry()
+        try:
+            self._local_inference_capability = await probe_inference_capability(
+                self.household.device_did or "", self.data_dir
+            )
+            self._inference_registry.update_device(
+                self.household.device_did or "", self._local_inference_capability
+            )
+        except Exception:
+            # Probing must never block daemon startup.
+            self._local_inference_capability = None
+
+        self.transport.on_message(MessageTypes.INFERENCE_SETUP, self._handle_inference_setup)
+        self.transport.on_message(MessageTypes.INFERENCE_READY, self._handle_inference_ready)
+        self.transport.on_message(MessageTypes.INFERENCE_TEARDOWN, self._handle_inference_teardown)
+        self.transport.on_message(MessageTypes.INFERENCE_PROBE, self._handle_inference_probe)
+        self.transport.on_message(
+            MessageTypes.INFERENCE_PROBE_RESPONSE, self._handle_inference_probe_response
+        )
+        self.transport.on_message(MessageTypes.STREAM_CHUNK, self._handle_stream_chunk)
+
+        # Web dashboard HTTP/SSE API. Best-effort: if the port is in use we
+        # log and continue without it — the daemon itself is fully functional.
+        if enable_api:
+            self._api = DashboardAPI(self, host=api_host, port=api_port)
+            ok = await self._api.start()
+            if ok:
+                import logging as _lg
+                _lg.getLogger(__name__).info(
+                    "Dashboard available at http://%s:%s", api_host, self._api.port
+                )
+            else:
+                self._api = None
+
     async def stop(self) -> None:
-        for component in (self.sync, self.profiler, self.discovery, self.transport):
+        for component in (self._api, self.sync, self.profiler, self.discovery, self.transport):
             if component is None:
                 continue
             try:
                 await component.stop()
             except Exception:
                 pass
+        self._api = None
         self._started = False
 
     # -----------------------------------------------------------------------
@@ -166,6 +230,19 @@ class AriesNode:
         if not self._started:
             raise RuntimeError("Node not started; call start() first")
 
+    def _emit_event(self, event_type: str, description: str) -> None:
+        """Push an event to the live dashboard + web API event stream."""
+        if self._dashboard is not None:
+            try:
+                self._dashboard.add_event(event_type, description)
+            except Exception:
+                pass
+        if self._api is not None:
+            try:
+                self._api.push_event(event_type, description)
+            except Exception:
+                pass
+
     # -----------------------------------------------------------------------
     # agent registration
     # -----------------------------------------------------------------------
@@ -187,6 +264,7 @@ class AriesNode:
             cost_class=str(caps.get("cost_class", "free")),
         )
         self._adapters[record.agent_did] = adapter
+        self._emit_event("agent_register", f"Agent registered: {record.name}")
         return record
 
     def attach_adapter(self, agent_did: str, adapter: BaseAdapter) -> None:
@@ -206,9 +284,33 @@ class AriesNode:
         locality: Locality = Locality.HOUSEHOLD,
         tags: Optional[list[str]] = None,
         max_cost_class: str = "paid",
+        stream: bool = False,
     ) -> InvokeResponse:
         if self.household is None or self.scheduler is None:
             raise RuntimeError("Node not initialized")
+
+        # Consider distributed inference configs alongside single-agent routing.
+        # Only when the caller hasn't pinned a specific agent.
+        if self._inference_registry is not None and agent_did is None:
+            constraints = TaskConstraints(
+                capability=capability,
+                locality=locality,
+                tags=list(tags or []),
+                max_cost_class=max_cost_class,
+            )
+            healths = (
+                dict(self.scheduler._device_health) if self.scheduler is not None else {}
+            )
+            best = self._inference_registry.get_best_config(constraints, healths)
+            if best is not None and best.config_type == "distributed":
+                try:
+                    return await self._invoke_distributed(
+                        messages, best, system_prompt=system_prompt, stream=stream
+                    )
+                except RuntimeError:
+                    # llama-server unavailable or setup failed — fall through
+                    # to single-agent routing.
+                    pass
 
         agent: Optional[AgentRecord]
         if agent_did:
@@ -237,10 +339,12 @@ class AriesNode:
             )
 
         task_id = "task_" + uuid.uuid4().hex[:12]
+        ucan_token = agent.ucan_token  # agent-scoped writes pass this through
         if self.memory is not None:
             self.memory.set(
                 _canonical_request_key(task_id),
                 {"messages": [m.to_dict() for m in messages], "capability": capability},
+                ucan_token=ucan_token,
             )
 
         req = InvokeRequest(messages=list(messages), system_prompt=system_prompt)
@@ -252,12 +356,16 @@ class AriesNode:
             self.memory.set(
                 _canonical_response_key(task_id),
                 {"content": response.content, "model": response.model, "usage": response.usage},
+                ucan_token=ucan_token,
             )
             for m in messages:
-                self.memory.log_append(_canonical_history_key(task_id), m.to_dict())
+                self.memory.log_append(
+                    _canonical_history_key(task_id), m.to_dict(), ucan_token=ucan_token
+                )
             self.memory.log_append(
                 _canonical_history_key(task_id),
                 Message(role="assistant", content=response.content).to_dict(),
+                ucan_token=ucan_token,
             )
 
         # receipt
@@ -282,6 +390,149 @@ class AriesNode:
 
         response.metadata["task_id"] = task_id
         return response
+
+    async def invoke_stream(
+        self,
+        messages: list[Message],
+        capability: str = "text.qa",
+        system_prompt: Optional[str] = None,
+        agent_did: Optional[str] = None,
+        locality: Locality = Locality.HOUSEHOLD,
+        tags: Optional[list[str]] = None,
+        max_cost_class: str = "paid",
+    ) -> AsyncIterator[str]:
+        """Stream tokens from the best-scoring agent / inference configuration.
+
+        Same scheduler logic as `invoke()` — but yields tokens as they arrive
+        from the adapter (or distributed coordinator). Conversation history,
+        the assistant reply, and a signed receipt are persisted after the
+        stream completes. If the adapter doesn't implement `invoke_stream`
+        (raises NotImplementedError), falls back to the batch `invoke()` path
+        and yields the response as a single chunk.
+        """
+        if self.household is None or self.scheduler is None:
+            raise RuntimeError("Node not initialized")
+
+        # Distributed inference path (rare in unit tests; gated by llama-server).
+        if self._inference_registry is not None and agent_did is None:
+            constraints = TaskConstraints(
+                capability=capability,
+                locality=locality,
+                tags=list(tags or []),
+                max_cost_class=max_cost_class,
+            )
+            healths = (
+                dict(self.scheduler._device_health) if self.scheduler is not None else {}
+            )
+            best_cfg = self._inference_registry.get_best_config(constraints, healths)
+            if best_cfg is not None and best_cfg.config_type == "distributed":
+                try:
+                    coordinator = InferenceCoordinator(node=self, config=best_cfg)
+                    ok = await coordinator.setup()
+                    if ok:
+                        try:
+                            async for tok in coordinator.generate(
+                                prompt=messages[-1].content if messages else "",
+                                system_prompt=system_prompt,
+                                stream=True,
+                            ):
+                                yield tok
+                            await coordinator.teardown()
+                            return
+                        except Exception:
+                            await coordinator.teardown()
+                except RuntimeError:
+                    pass  # fall through to single-agent path
+
+        # Single-agent path: same selection logic as invoke().
+        agent: Optional[AgentRecord]
+        if agent_did:
+            agent = self.household.agents.get(agent_did)
+            if agent is None:
+                raise ValueError(f"Agent {agent_did} not registered")
+        else:
+            constraints = TaskConstraints(
+                capability=capability,
+                locality=locality,
+                tags=list(tags or []),
+                max_cost_class=max_cost_class,
+            )
+            agents = list(self.household.agents.values())
+            chosen = self.scheduler.select_agent(
+                agents, constraints, device_did_map=self._agent_device_map()
+            )
+            if chosen is None:
+                raise RuntimeError(f"No agent satisfies capability={capability!r}")
+            agent, _score = chosen
+
+        adapter = self._adapters.get(agent.agent_did)
+        if adapter is None:
+            raise RuntimeError(
+                f"Agent {agent.agent_did[:24]}... has a record but no live adapter on this device"
+            )
+
+        task_id = "task_" + uuid.uuid4().hex[:12]
+        ucan_token = agent.ucan_token  # may be None for unsigned agent records
+        if self.memory is not None:
+            self.memory.set(
+                _canonical_request_key(task_id),
+                {"messages": [m.to_dict() for m in messages], "capability": capability},
+                ucan_token=ucan_token,
+            )
+
+        req = InvokeRequest(
+            messages=list(messages), system_prompt=system_prompt, stream=True
+        )
+        start = time.perf_counter()
+        chunks: list[str] = []
+        try:
+            async for token in adapter.invoke_stream(req):
+                chunks.append(token)
+                yield token
+        except NotImplementedError:
+            # Adapter doesn't support streaming — fall back to batch call.
+            batch_req = InvokeRequest(messages=list(messages), system_prompt=system_prompt)
+            response = await adapter.invoke(batch_req)
+            chunks = [response.content]
+            yield response.content
+        elapsed = (time.perf_counter() - start) * 1000.0
+        content = "".join(chunks)
+
+        if self.memory is not None:
+            self.memory.set(
+                _canonical_response_key(task_id),
+                {"content": content, "model": agent.model or agent.vendor, "usage": {}},
+                ucan_token=ucan_token,
+            )
+            for m in messages:
+                self.memory.log_append(
+                    _canonical_history_key(task_id), m.to_dict(), ucan_token=ucan_token
+                )
+            self.memory.log_append(
+                _canonical_history_key(task_id),
+                Message(role="assistant", content=content).to_dict(),
+                ucan_token=ucan_token,
+            )
+
+        # Receipt (no UCAN — internal node infrastructure).
+        keypair = self._device_keypair()
+        chain = self._receipt_chains.setdefault(task_id, ReceiptChain())
+        chain.add(
+            Receipt(
+                task_id=task_id,
+                device_did=self.household.device_did or "",
+                agent_did=agent.agent_did,
+                action="invoke_stream",
+                model_used=agent.model or agent.vendor,
+                tokens_used=len(chunks),
+                latency_ms=elapsed,
+                input_hash=_hash_messages(messages),
+                output_hash=_hash_text(content),
+                summary=content[:80],
+            ),
+            keypair=keypair,
+            signer_did=self.household.device_did or "",
+        )
 
     def _device_keypair(self) -> KeyPair:
         if self.household is None or self.household._device_key is None:
@@ -363,6 +614,10 @@ class AriesNode:
             body=cont.to_dict(),
         )
         await peer_conn.send(msg)
+        self._emit_event(
+            "handoff_sent",
+            f"Handoff sent → {target_device_did[:16]}... ({reason.code})",
+        )
         return cont
 
     async def handoff_to_best_peer(
@@ -409,6 +664,99 @@ class AriesNode:
         return await self.invoke(messages)
 
     # -----------------------------------------------------------------------
+    # distributed inference
+    # -----------------------------------------------------------------------
+
+    async def _invoke_distributed(
+        self,
+        messages: list[Message],
+        config: InferenceConfig,
+        *,
+        system_prompt: Optional[str] = None,
+        stream: bool = False,
+    ) -> InvokeResponse:
+        """Run inference via llama.cpp RPC across the mesh.
+
+        Sets up an InferenceCoordinator, streams tokens, persists the
+        conversation to shared memory, and writes a signed receipt. On any
+        failure during setup, raises RuntimeError so the caller in invoke()
+        can fall back to single-agent routing.
+        """
+        assert self.household is not None
+        task_id = "task_" + uuid.uuid4().hex[:12]
+        start = time.perf_counter()
+        coordinator = InferenceCoordinator(node=self, config=config)
+
+        try:
+            ok = await coordinator.setup()
+            if not ok:
+                raise RuntimeError(
+                    f"Distributed inference setup failed for config {config.config_id}"
+                )
+
+            prompt = messages[-1].content if messages else ""
+            chunks: list[str] = []
+            async for token in coordinator.generate(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                stream=stream,
+            ):
+                chunks.append(token)
+            content = "".join(chunks)
+        finally:
+            await coordinator.teardown()
+
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        if self.memory is not None:
+            self.memory.set(
+                _canonical_request_key(task_id),
+                {
+                    "messages": [m.to_dict() for m in messages],
+                    "config_id": config.config_id,
+                    "model": config.model_name,
+                },
+            )
+            self.memory.set(
+                _canonical_response_key(task_id),
+                {"content": content, "model": config.model_name, "usage": {}},
+            )
+            for m in messages:
+                self.memory.log_append(_canonical_history_key(task_id), m.to_dict())
+            self.memory.log_append(
+                _canonical_history_key(task_id),
+                Message(role="assistant", content=content).to_dict(),
+            )
+
+        # Receipt for the distributed inference event.
+        keypair = self._device_keypair()
+        chain = self._receipt_chains.setdefault(task_id, ReceiptChain())
+        chain.add(
+            Receipt(
+                task_id=task_id,
+                device_did=self.household.device_did or "",
+                agent_did="",
+                action="invoke_distributed",
+                model_used=config.model_name,
+                tokens_used=len(chunks),
+                latency_ms=elapsed_ms,
+                input_hash=_hash_messages(messages),
+                output_hash=_hash_text(content),
+                summary=f"config={config.config_id} devices={len(config.devices)}",
+            ),
+            keypair=keypair,
+            signer_did=self.household.device_did or "",
+        )
+
+        return InvokeResponse(
+            content=content,
+            model=config.model_name,
+            usage={"prompt_tokens": 0, "completion_tokens": len(chunks)},
+            latency_ms=elapsed_ms,
+            metadata={"task_id": task_id, "config_id": config.config_id},
+        )
+
+    # -----------------------------------------------------------------------
     # handlers
     # -----------------------------------------------------------------------
 
@@ -417,6 +765,10 @@ class AriesNode:
             body = msg.body
             messages = [Message.from_dict(m) for m in body.get("messages", [])]
             capability = body.get("capability", "text.qa")
+            self._emit_event(
+                "invoke",
+                f"Remote invoke: {capability} from {msg.sender_did[:16]}...",
+            )
             response = await self.invoke(messages=messages, capability=capability)
             reply = AriesMessage(
                 type=MessageTypes.INVOKE_RESULT,
@@ -486,6 +838,11 @@ class AriesNode:
             except Exception:
                 pass
             return
+
+        self._emit_event(
+            "handoff_recv",
+            f"Continuation received from {cont.source_device_did[:16]}...",
+        )
 
         # persist messages locally so resume / inspection works
         for m in cont.messages:
@@ -625,6 +982,151 @@ class AriesNode:
             pass
 
     # -----------------------------------------------------------------------
+    # inference message handlers (Feature 2)
+    # -----------------------------------------------------------------------
+
+    async def _handle_inference_setup(self, msg: AriesMessage, conn: PeerConnection) -> None:
+        """A peer is asking this node to start an rpc-server for distributed inference."""
+        if self.household is None:
+            return
+        body = msg.body
+        session_id = str(body.get("session_id", ""))
+        port = int(body.get("port", 50052))
+
+        rpc_path = None
+        if self._local_inference_capability is not None:
+            rpc_path = self._local_inference_capability.rpc_server_path
+
+        if not rpc_path:
+            err = AriesMessage(
+                type=MessageTypes.ERROR,
+                sender_did=self.household.device_did or "",
+                thread_id=msg.id,
+                body={
+                    "error": "rpc-server not available on this device",
+                    "session_id": session_id,
+                },
+            )
+            try:
+                await conn.send(err)
+            except Exception:
+                pass
+            return
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                rpc_path,
+                "--host", "0.0.0.0",
+                "--port", str(port),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            # Brief wait for the listening socket to bind.
+            await asyncio.sleep(0.5)
+            self._inference_rpc_processes[session_id] = proc
+
+            ready = AriesMessage(
+                type=MessageTypes.INFERENCE_READY,
+                sender_did=self.household.device_did or "",
+                thread_id=msg.id,
+                body={"session_id": session_id, "port": port},
+            )
+            await conn.send(ready)
+        except Exception as exc:
+            err = AriesMessage(
+                type=MessageTypes.ERROR,
+                sender_did=self.household.device_did or "",
+                thread_id=msg.id,
+                body={"error": repr(exc), "session_id": session_id},
+            )
+            try:
+                await conn.send(err)
+            except Exception:
+                pass
+
+    async def _handle_inference_ready(self, msg: AriesMessage, conn: PeerConnection) -> None:
+        """A worker reports its rpc-server is up; resolve the pending future."""
+        fut = self._inference_ready_futures.pop(msg.sender_did, None)
+        if fut is not None and not fut.done():
+            fut.set_result(True)
+
+    async def _handle_inference_teardown(self, msg: AriesMessage, conn: PeerConnection) -> None:
+        """Peer is finishing the session; stop our rpc-server subprocess."""
+        if self.household is None:
+            return
+        session_id = str(msg.body.get("session_id", ""))
+        proc = self._inference_rpc_processes.pop(session_id, None)
+        if proc is not None:
+            try:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+            except (ProcessLookupError, Exception):
+                pass
+        ack = AriesMessage(
+            type=MessageTypes.ACK,
+            sender_did=self.household.device_did or "",
+            thread_id=msg.id,
+            body={"session_id": session_id, "status": "torn-down"},
+        )
+        try:
+            await conn.send(ack)
+        except Exception:
+            pass
+
+    async def _handle_inference_probe(self, msg: AriesMessage, conn: PeerConnection) -> None:
+        """Echo the probe payload back for round-trip / bandwidth measurement."""
+        if self.household is None:
+            return
+        reply = AriesMessage(
+            type=MessageTypes.INFERENCE_PROBE_RESPONSE,
+            sender_did=self.household.device_did or "",
+            thread_id=msg.id,
+            body=dict(msg.body),
+        )
+        try:
+            await conn.send(reply)
+        except Exception:
+            pass
+
+    async def _handle_inference_probe_response(
+        self, msg: AriesMessage, conn: PeerConnection
+    ) -> None:
+        """Resolve the pending measure_peer_network future for this probe id."""
+        thread = msg.thread_id or ""
+        fut = _PENDING_PROBES.pop(thread, None)
+        if fut is None or fut.done():
+            return
+        sent_ts = msg.body.get("ts")
+        if isinstance(sent_ts, (int, float)):
+            elapsed_ms = (time.perf_counter() - float(sent_ts)) * 1000.0
+            fut.set_result(elapsed_ms)
+        else:
+            fut.set_result(0.0)
+
+    async def _handle_stream_chunk(self, msg: AriesMessage, conn: PeerConnection) -> None:
+        """Receive a streamed token from a remote inference session.
+
+        Persist it to the relevant task's history. The CLI streaming UX is
+        responsible for any live-display behavior; v0.2 just stores the chunks.
+        """
+        if self.memory is None:
+            return
+        body = msg.body
+        task_id = str(body.get("task_id", ""))
+        token = str(body.get("token", ""))
+        done = bool(body.get("done", False))
+        if not task_id or (not token and not done):
+            return
+        self.memory.log_append(
+            _canonical_history_key(task_id),
+            {"role": "assistant_chunk", "content": token, "done": done},
+        )
+
+    # -----------------------------------------------------------------------
     # discovery / health callbacks
     # -----------------------------------------------------------------------
 
@@ -644,6 +1146,10 @@ class AriesNode:
             conn = await self.transport.connect_to_peer(peer)
         except (OSError, ConnectionError):
             return
+        self._emit_event(
+            "peer_connect",
+            f"Peer connected: {peer.name or peer.device_did[:16]}",
+        )
         announce = AriesMessage(
             type=MessageTypes.ANNOUNCE,
             sender_did=self.household.device_did or "",
@@ -708,8 +1214,8 @@ class AriesNode:
         self.household = Household(data_dir=self.data_dir)
         device_did, _ = self.household.initialize_joiner(device_name=device_name, platform=platform)
 
-        # bring up transport (no household_tag yet — we'll do an open discover)
-        self.transport = TransportServer()
+        # bring up transport — keypair is set by initialize_joiner above
+        self.transport = TransportServer(device_keypair=self.household._device_key)
         port = await self.transport.start()
         accept_future: asyncio.Future[dict[str, Any]] = asyncio.get_event_loop().create_future()
 
@@ -765,7 +1271,6 @@ class AriesNode:
 
         try:
             membership: Optional[str] = None
-            root_did: Optional[str] = None
             deadline = time.time() + 30
             while time.time() < deadline and membership is None:
                 try:
@@ -793,7 +1298,6 @@ class AriesNode:
                 try:
                     body = await asyncio.wait_for(accept_future, timeout=10)
                     membership = body.get("membership_ucan")
-                    root_did = body.get("user_root_did")
                     if membership:
                         break
                 except asyncio.TimeoutError:

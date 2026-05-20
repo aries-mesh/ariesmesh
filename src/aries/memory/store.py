@@ -1,6 +1,7 @@
 """CRDT-backed distributed key-value store with three namespaces.
 
-Spec reference: §12.
+Spec reference: §12. v0.2: optional UCAN-based ACL on write operations
+(see `_check_write_permission` and `_resource_covers_key`).
 """
 from __future__ import annotations
 
@@ -14,6 +15,9 @@ from typing import Any, Callable, Optional
 import cbor2
 
 from ..util import content_hash
+
+
+WRITE_ABILITY = "aries/context.write"
 
 
 # ---------------------------------------------------------------------------
@@ -244,9 +248,17 @@ class MemoryStore:
             return None
         return entry
 
-    def set(self, key: str, value: Any, ttl: Optional[float] = None) -> LWWEntry:
+    def set(
+        self,
+        key: str,
+        value: Any,
+        ttl: Optional[float] = None,
+        ucan_token: Optional[str] = None,
+    ) -> LWWEntry:
         key = normalize_key(key)
         ns, _ = from_key(key)
+        if ucan_token is not None:
+            self._check_write_permission(key, ucan_token)
         if ttl is None:
             ttl = DEFAULT_TTLS[ns]
         ts = self._tick()
@@ -278,9 +290,16 @@ class MemoryStore:
 
     # ----- append log API -----
 
-    def log_append(self, key: str, entry: dict[str, Any]) -> int:
+    def log_append(
+        self,
+        key: str,
+        entry: dict[str, Any],
+        ucan_token: Optional[str] = None,
+    ) -> int:
         key = normalize_key(key)
         from_key(key)  # validate namespace prefix
+        if ucan_token is not None:
+            self._check_write_permission(key, ucan_token)
         log = self._logs.setdefault(key, AppendLog())
         idx = log.append(entry, self.device_did)
         self._notify(key, entry)
@@ -400,3 +419,50 @@ class MemoryStore:
             log = AppendLog()
             log.entries = list(entries)
             self._logs[k] = log
+
+    # ----- ACL (v0.2) -----
+
+    def _check_write_permission(self, key: str, ucan_token: str) -> None:
+        """Raise PermissionError unless the UCAN authorizes writing to ``key``.
+
+        Looks for a capability with ability ``aries/context.write`` whose
+        resource covers the (already-normalized) key. Resource matching uses
+        the same glob/prefix semantics as ``Capability.is_attenuated_by``.
+
+        This is a fast capability-presence check; it does NOT walk the
+        delegation chain (that happens at agent-registration time).
+        """
+        from ..identity.ucan import UCANToken  # local import: ucan imports util
+
+        try:
+            token = UCANToken.decode(ucan_token)
+        except Exception as exc:
+            raise PermissionError(f"Invalid UCAN token: {exc}") from exc
+
+        normalized_key = normalize_key(key)
+        for cap in token.capabilities:
+            if cap.ability != WRITE_ABILITY:
+                continue
+            if _resource_covers_key(normalize_key(cap.resource), normalized_key):
+                return
+
+        raise PermissionError(
+            f"Agent {token.audience} not authorized to write to {normalized_key!r}. "
+            f"Required: {WRITE_ABILITY} on {normalized_key!r}"
+        )
+
+
+def _resource_covers_key(resource: str, key: str) -> bool:
+    """Return True if ``resource`` (a UCAN capability target) covers ``key``.
+
+    Matches the rules of ``Capability.is_attenuated_by`` from ucan.py:
+    wildcard ``*``, exact equality, ``/*`` glob suffix, or path-prefix.
+    """
+    if resource == "*":
+        return True
+    if resource == key:
+        return True
+    if resource.endswith("/*"):
+        prefix = resource[:-2]
+        return key == prefix or key.startswith(prefix + "/")
+    return key.startswith(resource.rstrip("/") + "/")
