@@ -111,27 +111,33 @@ Every device runs the same daemon. The scheduler decides where each task goes. M
 
 ---
 
-## Quickstart
+## Install
 
-### Install (recommended)
-
-**macOS / Linux / Android (Termux):**
+### macOS / Linux
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aries-mesh/ariesmesh/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/aries-mesh/ariesmesh/main/install.sh | bash
 ```
 
-Supports Linux x86_64, Linux ARM64 (Raspberry Pi 4/5 64-bit, Android via Termux, ARM Linux servers), and macOS Apple Silicon.
+Downloads the prebuilt binary for your architecture (x86_64 or ARM64) and installs it to `/usr/local/bin/aries` — falls back to `~/.local/bin` if that isn't writable.
 
-**Windows (PowerShell):**
+### Windows (PowerShell)
 
 ```powershell
 irm https://raw.githubusercontent.com/aries-mesh/ariesmesh/main/install.ps1 | iex
 ```
 
-No Python, no pip, no npm. A single self-contained binary lands at `/usr/local/bin/aries` (POSIX) or `%LOCALAPPDATA%\aries\aries.exe` (Windows). The dashboard is bundled inside — visit `http://localhost:7272` after `aries start`.
+Drops `aries.exe` under `%LOCALAPPDATA%\aries\` and adds it to your user PATH.
 
-### Install from source (contributors)
+### Android (Termux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/aries-mesh/ariesmesh/main/install.sh | bash
+```
+
+Automatically detected — the universal script hands off to `install-termux.sh`, which installs build prerequisites via `pkg` (`libsodium`, `rust`, `openssl`, …) and pip-installs Aries Mesh from git. `psutil` is skipped (Android-incompatible); the profiler ships with a safe-defaults fallback.
+
+### From source (contributors)
 
 ```bash
 git clone https://github.com/aries-mesh/ariesmesh.git
@@ -142,13 +148,19 @@ pip install -e ".[dev]"
 pytest -q                  # 82 tests passing
 ```
 
-To rebuild the web dashboard from source:
+To rebuild the web dashboard:
 
 ```bash
 cd dashboard
 npm install
 npm run build              # outputs to src/aries/dashboard/dist/
 ```
+
+No Python, no pip, no npm needed when installing from the prebuilt binary — the dashboard is bundled inside. Open `http://localhost:7272` after `aries start`.
+
+---
+
+## Quickstart
 
 ### Initialize and start
 

@@ -7,6 +7,20 @@
 # Detects OS + architecture, downloads the matching prebuilt binary from the
 # latest GitHub release, and installs it to /usr/local/bin (if writable) or
 # ~/.local/bin (with a PATH hint).
+#
+# On Termux (Android), redirects to install-termux.sh, which installs all
+# dependencies via Termux's package manager (so PyNaCl / blake3 / etc.
+# don't try to compile against missing system libraries) and pip-installs
+# Aries Mesh from source.
+
+# Detect Termux and hand off before any other logic runs.
+if [ -d "/data/data/com.termux" ]; then
+    echo "Termux detected — using Termux-specific installer..."
+    echo ""
+    exec curl -fsSL https://raw.githubusercontent.com/aries-mesh/ariesmesh/main/install-termux.sh | sh
+    exit 0
+fi
+
 set -e
 
 REPO="aries-mesh/ariesmesh"
