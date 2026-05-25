@@ -73,6 +73,30 @@ DOWNLOAD_URL=$(curl -fsSL "$RELEASE_URL" \
     | cut -d'"' -f4)
 
 if [ -z "$DOWNLOAD_URL" ]; then
+    # Termux fallback: no prebuilt binary for this arch yet, but Python is
+    # available on Android. Install from PyPI (or git) instead. The package
+    # uses optional psutil and degrades to safe defaults on Android.
+    if [ -d "/data/data/com.termux" ]; then
+        echo ""
+        echo "No pre-built '$ASSET_NAME' found in the latest release."
+        echo "Falling back to a Python install on Termux..."
+        echo ""
+        pkg install -y python git 2>/dev/null || true
+        if pip install --upgrade aries-mesh 2>/dev/null; then
+            :
+        else
+            echo "PyPI install failed; trying directly from git..."
+            pip install --upgrade "git+https://github.com/$REPO.git"
+        fi
+        echo ""
+        echo "Aries Mesh installed via Python."
+        echo ""
+        echo "Get started:"
+        echo "  aries init --name $(hostname)"
+        echo "  aries start"
+        exit 0
+    fi
+
     echo "Error: could not locate an asset named '$ASSET_NAME' in the latest release."
     echo "Browse available downloads:"
     echo "  https://github.com/$REPO/releases/latest"

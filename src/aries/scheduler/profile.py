@@ -1,6 +1,12 @@
 """Hardware monitoring via psutil; periodic DeviceHealth snapshots.
 
 Spec reference: §11.
+
+psutil is an optional dependency. It isn't installable on Android/Termux
+because the package requires CPython headers and procfs interfaces that the
+Termux environment doesn't expose. When psutil is missing, the profiler
+returns conservative defaults so the rest of the daemon still works — the
+scheduler simply scores devices on partial information instead of crashing.
 """
 from __future__ import annotations
 
@@ -13,7 +19,12 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-import psutil
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:  # pragma: no cover — exercised on Android/Termux only
+    psutil = None  # type: ignore[assignment]
+    PSUTIL_AVAILABLE = False
 
 from .router import DeviceHealth
 
@@ -38,6 +49,25 @@ class DeviceProfiler:
         self._on_update.append(cb)
 
     def snapshot(self) -> DeviceHealth:
+        if not PSUTIL_AVAILABLE:
+            # Android/Termux fallback: conservative defaults. The scheduler
+            # will treat this device as "small but available" — privacy and
+            # cost still win, just no battery/thermal nuance.
+            return DeviceHealth(
+                device_did=self.device_did,
+                cpu_percent=0.0,
+                ram_available_gb=4.0,
+                ram_total_gb=8.0,
+                gpu_utilization=0.0,
+                vram_available_gb=0.0,
+                battery_pct=100.0,
+                charging=True,
+                thermal="nominal",
+                network_type="wifi",
+                bandwidth_mbps=50.0,
+                last_updated=time.time(),
+            )
+
         cpu = psutil.cpu_percent(interval=0.1)
         mem = psutil.virtual_memory()
 
@@ -107,7 +137,25 @@ class DeviceProfiler:
             disk = shutil.disk_usage(Path("/").as_posix() if platform.system() != "Windows" else "C:\\")
         except Exception:
             disk = None
-        info: dict[str, object] = {
+
+        if not PSUTIL_AVAILABLE:
+            info: dict[str, object] = {
+                "platform": platform.system().lower(),
+                "platform_version": platform.version(),
+                "arch": platform.machine(),
+                "cpu_model": platform.processor() or "unknown",
+                "cpu_cores": 0,
+                "cpu_threads": 0,
+                "ram_total_gb": 8.0,
+                "hostname": socket.gethostname(),
+                "python": sys.version.split()[0],
+            }
+            if disk:
+                info["disk_total_gb"] = disk.total / (1024 ** 3)
+                info["disk_free_gb"] = disk.free / (1024 ** 3)
+            return info
+
+        info = {
             "platform": platform.system().lower(),
             "arch": platform.machine(),
             "cpu_cores": psutil.cpu_count(logical=False) or 0,

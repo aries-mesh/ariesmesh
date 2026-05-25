@@ -21,7 +21,12 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
-import psutil
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:  # pragma: no cover — Android/Termux only
+    psutil = None  # type: ignore[assignment]
+    PSUTIL_AVAILABLE = False
 
 from .registry import DeviceCapability, ModelInfo
 
@@ -59,9 +64,16 @@ _DISK_SPEED_TTL_S = 300.0
 
 async def probe_inference_capability(device_did: str, data_dir: Path) -> DeviceCapability:
     """Build a DeviceCapability snapshot for this device."""
-    mem = psutil.virtual_memory()
-    ram_total = mem.total / (1024**3)
-    ram_avail = mem.available / (1024**3)
+    if PSUTIL_AVAILABLE:
+        mem = psutil.virtual_memory()
+        ram_total = mem.total / (1024**3)
+        ram_avail = mem.available / (1024**3)
+    else:
+        # Android/Termux: assume a modest mobile-class device. The scheduler
+        # will still produce a "local" InferenceConfig for small models; the
+        # numbers don't need to be exact because they only feed scoring.
+        ram_total = 8.0
+        ram_avail = 4.0
 
     has_gpu, gpu_name, vram_total, vram_avail, backend = _detect_gpu(ram_avail)
 
