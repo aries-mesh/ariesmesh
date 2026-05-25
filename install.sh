@@ -49,6 +49,14 @@ echo "Aries Mesh installer"
 echo "  OS:           $PLATFORM"
 echo "  Architecture: $ARCH_SUFFIX"
 echo "  Binary:       $ASSET_NAME"
+
+# Termux on Android exposes a writable filesystem at /data/data/com.termux —
+# surface it in the installer header so the user can tell at a glance that
+# the script recognized their environment.
+if [ -d "/data/data/com.termux" ]; then
+    echo "  Environment: Termux on Android"
+fi
+
 echo ""
 
 # --- Find the latest release asset ----------------------------------------

@@ -115,11 +115,13 @@ Every device runs the same daemon. The scheduler decides where each task goes. M
 
 ### Install (recommended)
 
-**macOS / Linux:**
+**macOS / Linux / Android (Termux):**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aries-mesh/ariesmesh/main/install.sh | sh
 ```
+
+Supports Linux x86_64, Linux ARM64 (Raspberry Pi 4/5 64-bit, Android via Termux, ARM Linux servers), and macOS Apple Silicon.
 
 **Windows (PowerShell):**
 

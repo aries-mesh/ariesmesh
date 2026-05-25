@@ -65,6 +65,66 @@ jobs:
           name: aries-linux-amd64
           path: dist/aries-linux-amd64
 
+  # ----------------------------------------------------------------- Linux arm64
+  # Targets Termux on Android, Raspberry Pi 4/5 (64-bit OS), ARM Linux servers.
+  # Uses GitHub's native ARM runner (free for public repos as of 2025) — far
+  # faster than QEMU emulation. If the runner label is ever retired, swap
+  # `runs-on` for `ubuntu-latest` and wrap the steps in `uraimo/run-on-arch-action`.
+  build-linux-arm:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Build dashboard
+        run: |
+          cd dashboard
+          npm ci
+          npm run build
+          test -f ../src/aries/dashboard/dist/index.html
+
+      - name: Install Python deps
+        run: |
+          pip install -e .
+          pip install pyinstaller
+
+      - name: Build binary
+        run: |
+          pyinstaller --onefile --name aries-linux-arm64 \
+            --add-data "src/aries/dashboard/dist:aries/dashboard/dist" \
+            --hidden-import=noiseprotocol \
+            --hidden-import=nacl \
+            --hidden-import=cbor2 \
+            --hidden-import=zeroconf \
+            --hidden-import=psutil \
+            --hidden-import=yaml \
+            --hidden-import=litellm \
+            --hidden-import=click \
+            --hidden-import=rich \
+            --hidden-import=blake3 \
+            --hidden-import=httpx \
+            --hidden-import=aiohttp \
+            --collect-all nacl \
+            --collect-all noiseprotocol \
+            --collect-all aiohttp \
+            --clean \
+            src/aries/cli/main.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aries-linux-arm64
+          path: dist/aries-linux-arm64
+
   # ---------------------------------------------------------------- macOS arm64
   build-macos-arm:
     # macos-latest defaults to Apple Silicon (M-series) runners as of 2024+.
@@ -183,7 +243,7 @@ jobs:
 
   # ----------------------------------------------------------------- Release
   release:
-    needs: [build-linux, build-macos-arm, build-windows]
+    needs: [build-linux, build-linux-arm, build-macos-arm, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -206,5 +266,6 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             artifacts/aries-linux-amd64/aries-linux-amd64
+            artifacts/aries-linux-arm64/aries-linux-arm64
             artifacts/aries-darwin-arm64/aries-darwin-arm64
             artifacts/aries-windows-amd64/aries-windows-amd64.exe
