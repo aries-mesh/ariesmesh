@@ -61,7 +61,11 @@ try {
     exit 1
 }
 
-# --- Add to user PATH if not already present ------------------------------
+# --- Persist install dir to the user PATH (registry) so future shells see it
+# We only touch the registry when the entry is missing, but we ALWAYS patch
+# the live $env:PATH below — because the registry write doesn't reach the
+# already-running PowerShell session, and a user who pipes us through `iex`
+# expects `aries` to be on PATH immediately.
 
 $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
 if (-not $userPath) { $userPath = "" }
@@ -71,15 +75,34 @@ if ($pathEntries -notcontains $installDir) {
     [Environment]::SetEnvironmentVariable("PATH", $newPath, "User")
     Write-Host ""
     Write-Host "Added $installDir to your user PATH." -ForegroundColor Yellow
-    Write-Host "Open a new PowerShell window for the change to take effect." -ForegroundColor Yellow
+}
+
+# --- Patch the CURRENT shell so `aries` resolves right away
+# `irm | iex` runs this script in-process; mutating $env:PATH persists for
+# the rest of the user's session, no terminal restart needed.
+$liveEntries = $env:PATH -split ";" | Where-Object { $_ -ne "" }
+if ($liveEntries -notcontains $installDir) {
+    $env:PATH = "$installDir;$env:PATH"
 }
 
 Write-Host ""
 Write-Host "Aries Mesh installed to $binaryPath" -ForegroundColor Green
 Write-Host ""
-Write-Host "Get started:" -ForegroundColor Cyan
-Write-Host "  aries init --name $env:COMPUTERNAME"
-Write-Host "  aries start"
+
+if (Get-Command aries -ErrorAction SilentlyContinue) {
+    Write-Host "Get started:" -ForegroundColor Cyan
+    Write-Host "  aries init --name $env:COMPUTERNAME"
+    Write-Host "  aries start"
+} else {
+    # Defensive: should not happen now that $env:PATH is patched in-process,
+    # but PowerShell's command-lookup cache can be quirky on edge cases
+    # (e.g. when the script is dot-sourced into a constrained-language host).
+    Write-Host "The 'aries' command isn't resolving in this session yet." -ForegroundColor Yellow
+    Write-Host "Run it directly with the full path:"
+    Write-Host "  & `"$binaryPath`" init --name $env:COMPUTERNAME"
+    Write-Host "Or open a new PowerShell window."
+}
+
 Write-Host ""
 Write-Host "Then open http://localhost:7272 for the dashboard."
 Write-Host ""
