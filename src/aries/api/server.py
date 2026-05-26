@@ -26,7 +26,12 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
-from aiohttp import web
+try:
+    from aiohttp import web
+    AIOHTTP_AVAILABLE = True
+except ImportError:  # pragma: no cover — minimal install only
+    web = None  # type: ignore[assignment]
+    AIOHTTP_AVAILABLE = False
 
 from ..identity.did import did_short
 
@@ -86,7 +91,14 @@ class DashboardAPI:
 
     async def start(self) -> bool:
         """Bring up the aiohttp server. Returns True on success, False if the
-        port is unavailable (caller can choose to retry or skip)."""
+        port is unavailable or aiohttp isn't installed (caller can choose to
+        retry or skip)."""
+        if not AIOHTTP_AVAILABLE:
+            logger.warning(
+                "aiohttp not available — web dashboard disabled. "
+                "Install with `pip install aries-mesh[full]`."
+            )
+            return False
         app = web.Application()
 
         app.router.add_get("/api/status", self._handle_status)

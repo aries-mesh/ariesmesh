@@ -40,7 +40,7 @@ from .scheduler.router import (
     TaskConstraints,
     load_mandates_from_yaml,
 )
-from .transport.discovery import DiscoveryService
+from .transport.discovery import ZEROCONF_AVAILABLE, DiscoveryService
 from .transport.peer import AriesMessage, MessageTypes, PeerConnection, PeerInfo, TransportServer
 
 
@@ -118,8 +118,10 @@ class AriesNode:
         self.transport.on_message(MessageTypes.ANNOUNCE, self._handle_announce)
         self.transport.on_message(MessageTypes.PAIRING_REQUEST, self._handle_pairing_request)
 
-        # discovery (skipped under enable_discovery=False)
-        if enable_discovery:
+        # discovery (skipped under enable_discovery=False or when zeroconf
+        # isn't installed — e.g. on Termux. Without it, peers must be added
+        # manually via `aries connect <ip:port>`.)
+        if enable_discovery and ZEROCONF_AVAILABLE:
             tag = self.household.household_tag
             self.discovery = DiscoveryService(
                 device_did=self.household.device_did or "",
@@ -130,6 +132,12 @@ class AriesNode:
             )
             self.discovery.on_peer_found(self._on_peer_discovered)
             await self.discovery.start()
+        elif enable_discovery and not ZEROCONF_AVAILABLE:
+            import logging as _lg
+            _lg.getLogger(__name__).info(
+                "mDNS discovery unavailable (zeroconf not installed). "
+                "Use `aries connect <ip:port>` to add peers manually."
+            )
 
         # profiler (skipped under enable_profiler=False)
         if enable_profiler:

@@ -1,6 +1,12 @@
 """Universal LLM adapter via litellm.
 
 Spec reference: §15.
+
+litellm is an optional dependency (it pulls in ~50 transitive packages and
+isn't always installable on Android/Termux). It is imported lazily inside
+``invoke`` / ``invoke_stream`` so this module loads on minimal installs;
+those methods raise ``ImportError`` with a helpful install hint if the
+caller tries to actually run a cloud / Ollama agent without it.
 """
 from __future__ import annotations
 
@@ -8,6 +14,20 @@ import time
 from typing import Any, AsyncIterator, Optional
 
 from .base import BaseAdapter, InvokeRequest, InvokeResponse
+
+
+try:
+    import litellm as _litellm_probe  # noqa: F401  — presence check only
+    LITELLM_AVAILABLE = True
+    del _litellm_probe
+except ImportError:  # pragma: no cover — exercised on minimal installs only
+    LITELLM_AVAILABLE = False
+
+
+_LITELLM_MISSING_MSG = (
+    "litellm is required for LiteLLMAdapter. "
+    "Install the full extras: `pip install aries-mesh[full]`."
+)
 
 
 def _infer_vendor(model: str) -> str:
@@ -75,7 +95,7 @@ class LiteLLMAdapter(BaseAdapter):
         try:
             import litellm
         except ImportError as e:
-            raise ImportError("litellm not installed") from e
+            raise ImportError(_LITELLM_MISSING_MSG) from e
 
         start = time.perf_counter()
         completion = await litellm.acompletion(**self._kwargs(request))
@@ -103,7 +123,7 @@ class LiteLLMAdapter(BaseAdapter):
         try:
             import litellm
         except ImportError as e:
-            raise ImportError("litellm not installed") from e
+            raise ImportError(_LITELLM_MISSING_MSG) from e
 
         kwargs = self._kwargs(request)
         kwargs["stream"] = True

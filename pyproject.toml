@@ -6,30 +6,55 @@ readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
 dependencies = [
+    # Core — pure Python (or has ARM wheels on PyPI) so `pip install aries-mesh`
+    # works on every platform that can run CPython 3.11+, including Termux on
+    # Android. Heavier deps (zeroconf, litellm, psutil, blake3, aiohttp, …)
+    # live under the [full] extra; the code degrades gracefully without them.
     "pynacl>=1.5.0",
     "cbor2>=5.6.0",
-    "zeroconf>=0.131.0",
     "click>=8.1.0",
-    "httpx>=0.27.0",
-    "litellm>=1.40.0,<1.50.0",
     "pydantic>=2.7.0",
     "rich>=13.7.0",
-    "uvloop>=0.19.0; platform_system != 'Windows'",
-    "websockets>=12.0",
-    "blake3>=0.4.0",
     "pyyaml>=6.0",
+    "httpx>=0.27.0",
     "noiseprotocol>=0.3.1",
-    "aiohttp>=3.9.0",
 ]
 
 [project.optional-dependencies]
-# psutil isn't installable on Android/Termux. It's an optional dep so plain
-# `pip install aries-mesh` succeeds there; the profiler returns safe defaults.
-# Anyone on a normal platform should install with `aries-mesh[full]`.
-full = ["psutil>=5.9.0"]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4.0", "psutil>=5.9.0"]
-semantic = ["sentence-transformers>=3.0.0", "numpy>=1.26.0"]
+# Full desktop install. mDNS discovery (zeroconf), LLM adapters (litellm),
+# hardware profiling (psutil), faster hashing (blake3), the web dashboard
+# (aiohttp), the macOS/Linux event loop (uvloop), and the reserved websocket
+# transport. Everything below is optional at runtime — the daemon will start
+# without any of them, falling back to safe defaults or warnings.
+full = [
+    "zeroconf>=0.131.0",
+    "litellm>=1.40.0,<1.50.0",
+    "psutil>=5.9.0",
+    "uvloop>=0.19.0;platform_system!='Windows'",
+    "websockets>=12.0",
+    "blake3>=0.4.0",
+    "aiohttp>=3.9.0",
+]
+
+# Distributed inference engine.
 inference = ["llama-cpp-python>=0.3.0"]
+
+# Optional embedding/semantic deps (kept from earlier extras).
+semantic = ["sentence-transformers>=3.0.0", "numpy>=1.26.0"]
+
+# Contributors: install everything plus the test runner / linter so the
+# full 82-test suite passes locally.
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4.0",
+    "zeroconf>=0.131.0",
+    "litellm>=1.40.0,<1.50.0",
+    "psutil>=5.9.0",
+    "websockets>=12.0",
+    "blake3>=0.4.0",
+    "aiohttp>=3.9.0",
+]
 
 [project.scripts]
 aries = "aries.cli.main:cli"

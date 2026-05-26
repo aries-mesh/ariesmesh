@@ -1,17 +1,34 @@
 """mDNS service advertisement and peer discovery using zeroconf.
 
 Spec reference: §9.
+
+zeroconf is an optional dependency: the package isn't reliably installable
+on Termux/Android. When it's missing, ``DiscoveryService.start()`` logs a
+warning and returns; the daemon still works — peers must be added manually
+via ``aries connect <ip:port>``.
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 import socket
 from typing import Callable, Optional
 
-from zeroconf import IPVersion, ServiceStateChange
-from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZeroconf
+try:
+    from zeroconf import IPVersion, ServiceStateChange
+    from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZeroconf
+    ZEROCONF_AVAILABLE = True
+except ImportError:  # pragma: no cover — Android/Termux only
+    IPVersion = None  # type: ignore[assignment]
+    ServiceStateChange = None  # type: ignore[assignment]
+    AsyncServiceBrowser = None  # type: ignore[assignment]
+    AsyncServiceInfo = None  # type: ignore[assignment]
+    AsyncZeroconf = None  # type: ignore[assignment]
+    ZEROCONF_AVAILABLE = False
 
 from .peer import PeerInfo
+
+logger = logging.getLogger(__name__)
 
 
 SERVICE_TYPE = "_aries._tcp.local."
@@ -49,6 +66,13 @@ class DiscoveryService:
         self._on_peer_lost = cb
 
     async def start(self) -> None:
+        if not ZEROCONF_AVAILABLE:
+            logger.warning(
+                "zeroconf not available — mDNS discovery disabled. "
+                "Use `aries connect <ip:port>` to add peers manually, "
+                "or install with `pip install aries-mesh[full]`."
+            )
+            return
         from zeroconf import ServiceInfo  # local to keep cold-import cheap
 
         self._zc = AsyncZeroconf(ip_version=IPVersion.V4Only)
@@ -156,6 +180,8 @@ class DiscoveryService:
         return ip
 
     async def stop(self) -> None:
+        if not ZEROCONF_AVAILABLE:
+            return
         if self._browser is not None:
             await self._browser.async_cancel()
         if self._zc is not None:

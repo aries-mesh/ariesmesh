@@ -162,6 +162,124 @@ def start(ctx: click.Context, no_dashboard: bool, no_api: bool, api_port: int) -
 
 
 # ---------------------------------------------------------------------------
+# connect — manual peer connection (fallback when mDNS is unavailable)
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.argument("address")
+@click.option(
+    "--no-dashboard",
+    is_flag=True,
+    help="Disable the live terminal dashboard and run with a plain status line.",
+)
+@click.option(
+    "--no-api",
+    is_flag=True,
+    help="Don't start the web dashboard HTTP API.",
+)
+@click.option(
+    "--api-port",
+    default=7272,
+    show_default=True,
+    type=int,
+    help="Port for the web dashboard API (localhost only).",
+)
+@click.pass_context
+def connect(
+    ctx: click.Context,
+    address: str,
+    no_dashboard: bool,
+    no_api: bool,
+    api_port: int,
+) -> None:
+    """Start the daemon and manually connect to a peer at HOST:PORT.
+
+    Equivalent to `aries start` plus an explicit `connect_to_peer` call —
+    used on Termux or any other environment where mDNS discovery is
+    unavailable. ADDRESS is the peer's TCP endpoint, for example:
+
+        aries connect 192.168.1.42:47291
+    """
+    from ..transport.peer import PeerInfo
+
+    if ":" not in address:
+        console.print(f"[red]Invalid address {address!r}: expected `host:port`.[/red]")
+        raise click.Abort()
+    host, port_str = address.rsplit(":", 1)
+    try:
+        port = int(port_str)
+    except ValueError:
+        console.print(f"[red]Invalid port in {address!r}: {port_str}[/red]")
+        raise click.Abort() from None
+
+    async def _go() -> None:
+        node = AriesNode(data_dir=ctx.obj["data_dir"])
+        await node.start(enable_api=not no_api, api_port=api_port)
+        if node._api is not None:
+            console.print(
+                f"[dim]Dashboard:[/dim] [bold green]http://localhost:{node._api.port}[/bold green]"
+            )
+
+        # `device_did="unknown"` matches the server-side `_handle_connection`
+        # convention — the receive loop will fill it in from the peer's first
+        # signed message and register the connection by DID at that point.
+        peer = PeerInfo(
+            device_did="unknown",
+            name=address,
+            host=host,
+            port=port,
+            household_tag=(node.household.household_tag if node.household else ""),
+        )
+        try:
+            await node._connect_and_announce(peer)
+            console.print(
+                f"[green]Connected to {address}[/green] "
+                "[dim](peer DID will resolve on next ANNOUNCE)[/dim]"
+            )
+        except Exception as exc:
+            console.print(f"[red]Failed to connect to {address}: {exc}[/red]")
+
+        if no_dashboard:
+            console.print(
+                Panel.fit(
+                    f"[bold]Aries daemon running[/bold]\n"
+                    f"Device DID:    {node.household.device_did}\n"
+                    f"Household tag: {node.household.household_tag}\n"
+                    f"TCP port:      {node.transport.port if node.transport else '?'}\n"
+                    f"Manual peer:   {address}",
+                    title="aries connect",
+                )
+            )
+            try:
+                while True:
+                    await asyncio.sleep(3600)
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                console.print("[yellow]Shutting down...[/yellow]")
+            finally:
+                await node.stop()
+            return
+
+        from .dashboard import TerminalDashboard
+        dashboard = TerminalDashboard(node)
+        node._dashboard = dashboard
+        node._emit_event(
+            "node_start",
+            f"Aries daemon started on port {node.transport.port if node.transport else '?'}",
+        )
+        node._emit_event("peer_manual_connect", f"Manual peer requested: {address}")
+        try:
+            await dashboard.run()
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
+        finally:
+            node._dashboard = None
+            await node.stop()
+            console.print("[yellow]Shutting down...[/yellow]")
+
+    run_async(_go())
+
+
+# ---------------------------------------------------------------------------
 # status
 # ---------------------------------------------------------------------------
 

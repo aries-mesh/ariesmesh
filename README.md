@@ -61,7 +61,8 @@ It sits beneath agent frameworks and model providers as the infrastructure layer
 - Web dashboard at `http://localhost:7272` — React + Tailwind, served by an aiohttp server bundled in the daemon. SSE stream for live events.
 
 **CLI**
-- `init`, `start`, `pair`, `register`, `agents`, `invoke`, `handoff`, `resume`, `status`, `memory`, `household`, `mandate`, `inference {status,run,benchmark}`
+- `init`, `start`, `connect`, `pair`, `register`, `agents`, `invoke`, `handoff`, `resume`, `status`, `memory`, `household`, `mandate`, `inference {status,run,benchmark}`
+- `aries connect <ip:port>` is the mDNS-free fallback used on Termux and other environments where `zeroconf` isn't available
 
 **Distribution**
 - Standalone binaries for Linux / macOS (Apple Silicon) / Windows via PyInstaller — one-line install (`curl | sh` or `irm | iex`), no Python required
@@ -135,7 +136,37 @@ Drops `aries.exe` under `%LOCALAPPDATA%\aries\` and adds it to your user PATH.
 curl -fsSL https://raw.githubusercontent.com/aries-mesh/ariesmesh/main/install.sh | bash
 ```
 
-Automatically detected — the universal script hands off to `install-termux.sh`, which installs build prerequisites via `pkg` (`libsodium`, `rust`, `openssl`, …) and pip-installs Aries Mesh from git. `psutil` is skipped (Android-incompatible); the profiler ships with a safe-defaults fallback.
+Automatically detected — the universal script hands off to `install-termux.sh`, which simply runs `pkg install python git` and `pip install git+…`. The core package is pure-Python plus PyNaCl (which has ARM wheels on PyPI), so no native compilation is needed. Heavy extras (`zeroconf`, `litellm`, `psutil`, `aiohttp`, `blake3`) are skipped and the daemon detects their absence at runtime:
+
+| Capability | Termux | Why |
+|---|---|---|
+| Encrypted Noise transport | ✓ | PyNaCl ARM wheel |
+| Shared memory + CRDT sync | ✓ | pure Python |
+| Signed continuations / receipts | ✓ | pure Python |
+| Terminal dashboard | ✓ | Rich is pure Python |
+| Routes tasks to peers | ✓ | only sends INVOKE messages |
+| Manual peer add via `aries connect` | ✓ | mDNS-free fallback |
+| mDNS auto-discovery | — | `zeroconf` skipped → use `aries connect` |
+| Web dashboard at `:7272` | — | `aiohttp` skipped |
+| Local LLM inference (Ollama / cloud) | — | `litellm` skipped → routes to peers |
+| Hardware profiling (CPU / battery) | — | `psutil` skipped → safe defaults |
+| BLAKE3 hashing | — | falls back to SHA-256 |
+
+After install, point your phone at your desktop's IP:port in one command:
+
+```bash
+aries init --name my-phone
+aries connect 192.168.1.42:47291    # starts daemon + adds your laptop as a peer
+```
+
+### From PyPI (any platform, lighter than the binary)
+
+```bash
+pip install aries-mesh[full]        # desktop — all features
+pip install aries-mesh              # minimal — same as Termux flow
+```
+
+The `[full]` extra adds `zeroconf`, `litellm`, `psutil`, `aiohttp`, `blake3`, `websockets`, and `uvloop` (the last only on non-Windows). Without it you get the lightweight Termux-style install with the same graceful-degradation behavior.
 
 ### From source (contributors)
 
@@ -192,6 +223,13 @@ On the second device:
 ```bash
 aries init --name my-phone
 aries pair --code "alpha anchor apple arrow seed shore"
+```
+
+**On Termux (or anywhere without mDNS):** skip `aries pair` and connect directly by IP. The first device prints its host:port in the terminal dashboard.
+
+```bash
+aries init --name my-phone
+aries connect 192.168.1.42:47291
 ```
 
 ### Hand off a conversation
@@ -289,7 +327,8 @@ aries-mesh/
 ├── .github/workflows/
 │   ├── ci.yml                     # pytest + ruff on every push/PR
 │   └── release.yml                # PyInstaller binary build on v* tags
-├── install.sh                     # macOS / Linux one-liner installer
+├── install.sh                     # Universal POSIX installer (redirects to install-termux.sh on Android)
+├── install-termux.sh              # Termux-only minimal pip install (no native deps)
 ├── install.ps1                    # Windows PowerShell installer
 └── pyproject.toml
 ```
