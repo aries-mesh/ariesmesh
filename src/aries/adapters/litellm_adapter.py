@@ -10,18 +10,19 @@ caller tries to actually run a cloud / Ollama agent without it.
 """
 from __future__ import annotations
 
+import importlib.util
 import time
 from typing import Any, AsyncIterator, Optional
 
 from .base import BaseAdapter, InvokeRequest, InvokeResponse
 
 
-try:
-    import litellm as _litellm_probe  # noqa: F401  — presence check only
-    LITELLM_AVAILABLE = True
-    del _litellm_probe
-except ImportError:  # pragma: no cover — exercised on minimal installs only
-    LITELLM_AVAILABLE = False
+# Use `find_spec` (no actual import) so the static analyzer in PyInstaller
+# does NOT pull litellm into the binary. litellm has heavy data deps
+# (tiktoken encoding tables, model price tables, etc.) that PyInstaller
+# can't bundle without extra `--collect-all` flags. Keeping it lazy means
+# `pip install aries-mesh[full]` is the supported path for cloud adapters.
+LITELLM_AVAILABLE = importlib.util.find_spec("litellm") is not None
 
 
 _LITELLM_MISSING_MSG = (

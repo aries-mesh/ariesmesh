@@ -58,7 +58,7 @@ jobs:
             --collect-all noiseprotocol \
             --collect-all aiohttp \
             --clean \
-            src/aries/cli/main.py
+            entry.py
 
       - uses: actions/upload-artifact@v4
         with:
@@ -118,7 +118,7 @@ jobs:
             --collect-all noiseprotocol \
             --collect-all aiohttp \
             --clean \
-            src/aries/cli/main.py
+            entry.py
 
       - uses: actions/upload-artifact@v4
         with:
@@ -175,7 +175,7 @@ jobs:
             --collect-all noiseprotocol \
             --collect-all aiohttp \
             --clean \
-            src/aries/cli/main.py
+            entry.py
 
       - uses: actions/upload-artifact@v4
         with:
@@ -234,7 +234,7 @@ jobs:
             --collect-all noiseprotocol `
             --collect-all aiohttp `
             --clean `
-            src/aries/cli/main.py
+            entry.py
 
       - uses: actions/upload-artifact@v4
         with:
