@@ -4,7 +4,7 @@
 
 **Do not open a public GitHub issue for security reports.**
 
-Email **bb1231033@iitd.ac.in** cc **indranilbhadra.iitd@gmail.com** with the subject line `[aries-mesh security] <short description>`. You will receive a response within 72 hours acknowledging receipt. If you have not heard back after 5 business days, follow up in the same thread.
+Email **indranilbhadra.iitd@gmail.com** with the subject line `[aries-mesh security] <short description>`. You will receive a response within 72 hours acknowledging receipt. If you have not heard back after 5 business days, follow up in the same thread.
 
 Please include:
 
