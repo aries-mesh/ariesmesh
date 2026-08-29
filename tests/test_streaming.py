@@ -120,11 +120,14 @@ async def test_invoke_stream_falls_back_to_batch() -> None:
 
 @pytest.mark.asyncio
 async def test_stream_chunk_message_over_transport() -> None:
+    from aries.identity.did import public_key_to_did
     from aries.identity.keys import KeyPair
     from aries.transport.peer import PeerConnection, PeerInfo, TransportServer
 
     kp_server = KeyPair.generate()
     kp_client = KeyPair.generate()
+    server_did = public_key_to_did(kp_server.public_bytes)
+    client_did = public_key_to_did(kp_client.public_bytes)
 
     server = TransportServer(device_keypair=kp_server)
     await server.start()
@@ -138,7 +141,7 @@ async def test_stream_chunk_message_over_transport() -> None:
 
     client_transport = TransportServer(device_keypair=kp_client)
     peer = PeerInfo(
-        device_did="server",
+        device_did=server_did,
         name="server",
         host="127.0.0.1",
         port=server.port,
@@ -148,7 +151,7 @@ async def test_stream_chunk_message_over_transport() -> None:
 
     msg = AriesMessage(
         type=MessageTypes.STREAM_CHUNK,
-        sender_did="client",
+        sender_did=client_did,
         body={"task_id": "task_xyz", "token": "hi", "index": 7, "done": False},
     )
     await conn.send(msg)

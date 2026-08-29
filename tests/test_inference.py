@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +17,7 @@ import pytest
 
 from aries.adapters.base import Message
 from aries.adapters.mock_adapter import MockAdapter
+from aries.identity.did import public_key_to_did
 from aries.identity.keys import KeyPair
 from aries.inference.capability import probe_inference_capability
 from aries.inference.coordinator import InferenceCoordinator
@@ -248,13 +250,15 @@ async def _make_host_worker_pair() -> tuple[_MockNode, TransportServer, str, Key
     """
     host_kp = KeyPair.generate()
     worker_kp = KeyPair.generate()
-    worker_did = "did:key:worker-test"
+    worker_did = public_key_to_did(worker_kp.public_bytes)
 
     worker_transport = TransportServer(device_keypair=worker_kp)
     await worker_transport.start()
 
     host_transport = TransportServer(device_keypair=host_kp)
-    host_node = _MockNode(host_transport, device_did="did:key:host-test")
+    host_node = _MockNode(
+        host_transport, device_did=public_key_to_did(host_kp.public_bytes)
+    )
 
     # Wire host's INFERENCE_READY handler to resolve the future.
     async def _on_ready(msg: AriesMessage, conn: PeerConnection) -> None:
@@ -529,3 +533,508 @@ def test_device_capability_serialization() -> None:
     assert restored.available_models[0].layer_count == 80
     assert restored.peer_latency_ms["did:key:peer1"] == 12.5
     assert restored.peer_bandwidth_mbps["did:key:peer1"] == 940.0
+
+
+# ---------------------------------------------------------------------------
+# Test 13 — max_tokens reaches the adapter on the single-agent path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_invoke_forwards_max_tokens_to_adapter() -> None:
+    """A caller's token budget must survive the trip; the flag used to be dropped."""
+
+    class _RecordingAdapter(MockAdapter):
+        def __init__(self) -> None:
+            super().__init__(canned_response="[recorded]")
+            self.seen: list[int] = []
+
+        async def invoke(self, request):  # type: ignore[override]
+            self.seen.append(request.max_tokens)
+            return await super().invoke(request)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        node = AriesNode(data_dir=tmp)
+        await node.initialize(device_name="solo", platform="linux")
+        await node.start(enable_discovery=False, enable_profiler=False, enable_api=False)
+        try:
+            adapter = _RecordingAdapter()
+            node.register_agent(adapter)
+
+            await node.invoke(
+                messages=[Message(role="user", content="hello")], max_tokens=77
+            )
+            assert adapter.seen == [77]
+
+            # Callers that say nothing still get the documented default.
+            await node.invoke(messages=[Message(role="user", content="hello")])
+            assert adapter.seen == [77, 4096]
+        finally:
+            await node.stop()
+
+
+# ---------------------------------------------------------------------------
+# Test 14 — a pinned config is the one that runs, and carries max_tokens with it
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pinned_config_runs_and_forwards_max_tokens(monkeypatch) -> None:
+    """`aries inference run --model X --max-tokens N` must honour both X and N.
+
+    Stubs the coordinator so no llama-server is needed — what is under test is
+    the wiring from invoke() down to generate(), not llama.cpp itself.
+    """
+    seen: dict[str, object] = {}
+
+    class _FakeCoordinator:
+        def __init__(self, node, config) -> None:
+            self.config = config
+
+        async def setup(self) -> bool:
+            return True
+
+        async def generate(
+            self, *, prompt, system_prompt=None, max_tokens=4096,
+            temperature=0.7, stream=True,
+        ):
+            seen["max_tokens"] = max_tokens
+            seen["config_id"] = self.config.config_id
+            yield "ok"
+
+        async def teardown(self) -> None:
+            return None
+
+    monkeypatch.setattr("aries.node.InferenceCoordinator", _FakeCoordinator)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        node = AriesNode(data_dir=tmp)
+        await node.initialize(device_name="solo", platform="linux")
+        await node.start(enable_discovery=False, enable_profiler=False, enable_api=False)
+        try:
+            config = _distributed_config("did:key:host", "did:key:worker")
+            resp = await node.invoke(
+                messages=[Message(role="user", content="hi")],
+                inference_config=config,
+                max_tokens=123,
+            )
+            assert seen["max_tokens"] == 123
+            # The pinned config ran — the scheduler did not substitute its own.
+            assert seen["config_id"] == config.config_id
+            assert resp.content == "ok"
+        finally:
+            await node.stop()
+
+
+# ---------------------------------------------------------------------------
+# Test 15 — `--model` selects by name, not by score
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_inference_config_honours_the_named_model() -> None:
+    """Shared by `inference run` and `inference benchmark`; both used to ignore
+    `--model` entirely and let the scheduler pick whatever scored highest."""
+    from aries.cli.main import _resolve_inference_config
+
+    wanted = _distributed_config("did:key:host", "did:key:worker")
+    wanted.model_name = "wanted-model"
+    decoy = _distributed_config("did:key:host", "did:key:worker")
+    decoy.model_name = "other-model"
+    decoy.privacy_score = 1.0  # outscores `wanted`, but is the wrong model
+    decoy.capability_score = 1.0
+
+    node = SimpleNamespace(
+        _inference_registry=SimpleNamespace(get_configs=lambda: [decoy, wanted]),
+        transport=None,
+    )
+    assert decoy.weighted_score() > wanted.weighted_score()
+    assert await _resolve_inference_config(node, "wanted-model", wait_s=0.0) is wanted
+
+    # Unknown model and missing registry both refuse rather than guessing.
+    assert await _resolve_inference_config(node, "no-such-model", wait_s=0.0) is None
+    empty = SimpleNamespace(_inference_registry=None, transport=None)
+    assert await _resolve_inference_config(empty, "x", wait_s=0.0) is None
+
+
+# ---------------------------------------------------------------------------
+# Test 16 — the benchmark timer separates prefill from decode
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_timed_runs_measures_ttft_not_total() -> None:
+    """TTFT used to be reported as total wall time, which made every arm of a
+    comparison look identical on that axis. Prefill and decode must be distinct."""
+    from aries.cli.main import _timed_runs
+
+    calls = {"n": 0}
+
+    async def _stream():
+        calls["n"] += 1
+        await asyncio.sleep(0.10)  # prefill
+        for _ in range(5):
+            yield "tok"
+            await asyncio.sleep(0.02)  # inter-token gap
+
+    records = await _timed_runs(_stream, runs=2, warmup=1)
+
+    # Warmup executed but is not in the medians.
+    assert calls["n"] == 3
+    assert len(records) == 2
+
+    for r in records:
+        assert r["tokens"] == 5
+        # The headline regression: TTFT is prefill, not the whole request.
+        assert r["ttft_s"] < r["total_s"] * 0.7
+        assert r["ttft_s"] >= 0.08
+        # 4 intervals across a ~0.10s decode window; wide bounds because sleep
+        # granularity on Windows is coarse.
+        assert 5.0 < r["decode_tok_s"] < 500.0
+
+
+@pytest.mark.asyncio
+async def test_timed_runs_excludes_empty_streams() -> None:
+    from aries.cli.main import _timed_runs
+
+    async def _empty():
+        return
+        yield ""  # pragma: no cover — makes this an async generator
+
+    assert await _timed_runs(_empty, runs=2, warmup=0) == []
+
+
+# ---------------------------------------------------------------------------
+# Capability exchange helpers
+# ---------------------------------------------------------------------------
+
+
+async def _started_node(tmp: str, name: str) -> AriesNode:
+    node = AriesNode(data_dir=tmp)
+    await node.initialize(device_name=name, platform="linux")
+    await node.start(enable_discovery=False, enable_profiler=False, enable_api=False)
+    return node
+
+
+async def _wait_for(predicate, timeout_s: float = 5.0) -> bool:
+    """Poll until `predicate()` is true; the exchange is a two-message round trip."""
+    deadline = 0.0
+    while deadline < timeout_s:
+        if predicate():
+            return True
+        await asyncio.sleep(0.05)
+        deadline += 0.05
+    return predicate()
+
+
+def _fake_capability(device_did: str, ram_gb: float, models) -> DeviceCapability:
+    return DeviceCapability(
+        device_did=device_did,
+        ram_total_gb=ram_gb,
+        ram_available_gb=ram_gb,
+        llama_cpp_available=True,
+        llama_cpp_path="/usr/local/bin/llama-server",
+        rpc_server_path="/usr/local/bin/rpc-server",
+        available_models=list(models),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 17 — peers exchange capabilities on connect, both directions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_peers_exchange_inference_capabilities() -> None:
+    with tempfile.TemporaryDirectory() as tmp_a, tempfile.TemporaryDirectory() as tmp_b:
+        node_a = await _started_node(tmp_a, "box-a")
+        node_b = await _started_node(tmp_b, "box-b")
+        did_a = node_a.household.device_did or ""
+        did_b = node_b.household.device_did or ""
+        try:
+            await node_a._connect_and_announce(
+                PeerInfo(
+                    device_did=did_b,
+                    name="box-b",
+                    host="127.0.0.1",
+                    port=node_b.transport.port,
+                    household_tag="",
+                )
+            )
+
+            # A pushed its capability with reply=True; B registers it and answers
+            # once, so both registries end up holding both devices.
+            assert await _wait_for(
+                lambda: len(node_b._inference_registry._device_capabilities) == 2
+            ), "peer capability never reached B"
+            assert await _wait_for(
+                lambda: len(node_a._inference_registry._device_capabilities) == 2
+            ), "reply capability never reached A"
+
+            assert did_a in node_b._inference_registry._device_capabilities
+            assert did_b in node_a._inference_registry._device_capabilities
+
+            # Dropping the link retires the peer's capability.
+            for conn in list(node_a.transport._connections.values()):
+                await conn.close()
+            assert await _wait_for(
+                lambda: did_b not in node_a._inference_registry._device_capabilities
+            ), "capability outlived the connection"
+        finally:
+            await node_a.stop()
+            await node_b.stop()
+
+
+# ---------------------------------------------------------------------------
+# Test 18 — a model too big for one box yields a distributed config
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_distributed_config_forms_across_two_devices() -> None:
+    """The whole point of the exchange: before it, `_compute_configs` only ever
+    saw one device and the worker loop ran zero iterations."""
+    registry = InferenceRegistry()
+    big_model = ModelInfo(
+        name="llama-70b-q4",
+        filename="llama-70b-q4.gguf",
+        size_gb=40.0,
+        path="/models/llama-70b-q4.gguf",
+        device_did="did:key:host",
+        layer_count=80,
+        context_window=8192,
+    )
+
+    # Host alone cannot hold a 40 GB model.
+    registry.update_device("did:key:host", _fake_capability("did:key:host", 24.0, [big_model]))
+    assert registry.get_configs() == []
+
+    # With a worker's memory published, the pair can.
+    registry.update_device("did:key:worker", _fake_capability("did:key:worker", 24.0, []))
+    configs = registry.get_configs()
+    assert [c.config_type for c in configs] == ["distributed"]
+    assert configs[0].model_name == "llama-70b-q4"
+    assert {r.device_did for r in configs[0].devices} == {"did:key:host", "did:key:worker"}
+
+    # And it goes away again when the worker leaves.
+    registry.remove_device("did:key:worker")
+    assert registry.get_configs() == []
+
+
+# ---------------------------------------------------------------------------
+# Test 19 — worker DIDs resolve to real addresses before llama-server sees them
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_setup_resolves_worker_dids_to_addresses() -> None:
+    host_node, worker_transport, worker_did, _, _ = await _make_host_worker_pair()
+
+    async def _on_setup(msg: AriesMessage, conn: PeerConnection) -> None:
+        await conn.send(
+            AriesMessage(
+                type=MessageTypes.INFERENCE_READY,
+                sender_did=worker_did,
+                body={"session_id": msg.body.get("session_id", "")},
+            )
+        )
+
+    worker_transport.on_message(MessageTypes.INFERENCE_SETUP, _on_setup)
+
+    config = _distributed_config(host_node.household.device_did, worker_did)
+    # What the registry stores is a placeholder, not something llama.cpp can dial.
+    assert config.rpc_endpoints == [f"{worker_did}:50052"]
+
+    coordinator = InferenceCoordinator(node=host_node, config=config, setup_timeout=2.0)
+    assert await coordinator.setup() is True
+    assert coordinator.resolved_rpc_endpoints == ["127.0.0.1:50052"]
+
+    await coordinator.teardown()
+    assert coordinator.resolved_rpc_endpoints == []
+    await host_node.transport.stop()
+    await worker_transport.stop()
+
+
+# ---------------------------------------------------------------------------
+# Test 20 — a config hosted by another device is refused, not mis-run locally
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_setup_refuses_config_hosted_elsewhere() -> None:
+    host_node, worker_transport, worker_did, _, _ = await _make_host_worker_pair()
+
+    # Host role belongs to a third device: the GGUF is on its disk, not ours.
+    config = _distributed_config("did:key:somebody-else", worker_did)
+    coordinator = InferenceCoordinator(node=host_node, config=config, setup_timeout=0.5)
+
+    assert await coordinator.setup() is False
+    assert coordinator.resolved_rpc_endpoints == []
+
+    await host_node.transport.stop()
+    await worker_transport.stop()
+
+
+# ---------------------------------------------------------------------------
+# Test 21 — end to end: a peer's models become configurations on this device
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_peer_models_become_configs_over_a_live_link() -> None:
+    with tempfile.TemporaryDirectory() as tmp_a, tempfile.TemporaryDirectory() as tmp_b:
+        # Only B has the model file on disk.
+        models_dir = Path(tmp_b) / "models"
+        models_dir.mkdir(parents=True, exist_ok=True)
+        (models_dir / "tiny-peer-model.gguf").write_bytes(b"GGUF" + b"\x00" * 2048)
+
+        node_a = await _started_node(tmp_a, "box-a")
+        node_b = await _started_node(tmp_b, "box-b")
+        did_b = node_b.household.device_did or ""
+        try:
+            assert any(
+                m.name == "tiny-peer-model"
+                for m in (node_b._local_inference_capability.available_models)
+            ), "B did not discover its own GGUF"
+            # A knows nothing about it yet.
+            assert not [
+                c for c in node_a._inference_registry.get_configs()
+                if c.model_name == "tiny-peer-model"
+            ]
+
+            await node_a._connect_and_announce(
+                PeerInfo(
+                    device_did=did_b,
+                    name="box-b",
+                    host="127.0.0.1",
+                    port=node_b.transport.port,
+                    household_tag="",
+                )
+            )
+
+            assert await _wait_for(
+                lambda: any(
+                    c.model_name == "tiny-peer-model"
+                    for c in node_a._inference_registry.get_configs()
+                )
+            ), "peer's model never produced a configuration on A"
+
+            config = next(
+                c for c in node_a._inference_registry.get_configs()
+                if c.model_name == "tiny-peer-model"
+            )
+            # The model lives on B, so B is the host — A cannot drive it.
+            host_role = next(r for r in config.devices if r.role == "host")
+            assert host_role.device_did == did_b
+            coordinator = InferenceCoordinator(node=node_a, config=config, setup_timeout=0.5)
+            assert await coordinator.setup() is False
+        finally:
+            await node_a.stop()
+            await node_b.stop()
+
+
+# ---------------------------------------------------------------------------
+# Test 22 — probes survive the Noise message ceiling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_measure_peer_network_over_encrypted_link() -> None:
+    """The old 64 KiB default exceeded the 65535-byte Noise transport limit, so
+    every bandwidth probe raised inside encrypt() and silently returned 100."""
+    from aries.inference.capability import (
+        DEFAULT_BANDWIDTH_MBPS,
+        DEFAULT_LATENCY_MS,
+        MAX_PROBE_PAYLOAD,
+        measure_peer_network,
+    )
+
+    assert MAX_PROBE_PAYLOAD < 65535 - 16, "probe must fit a Noise transport message"
+
+    host_node, worker_transport, worker_did, _, _ = await _make_host_worker_pair()
+
+    async def _echo(msg: AriesMessage, conn: PeerConnection) -> None:
+        await conn.send(
+            AriesMessage(
+                type=MessageTypes.INFERENCE_PROBE_RESPONSE,
+                sender_did=worker_did,
+                thread_id=msg.id,
+                body=dict(msg.body),
+            )
+        )
+
+    worker_transport.on_message(MessageTypes.INFERENCE_PROBE, _echo)
+    host_node.transport.on_message(
+        MessageTypes.INFERENCE_PROBE_RESPONSE, _resolve_probe_response
+    )
+
+    latency_ms, bandwidth_mbps = await measure_peer_network(
+        host_node.transport, worker_did, sender_did="", rounds=2
+    )
+
+    # A real round trip happened: loopback beats the 50 ms give-up default.
+    assert 0.0 < latency_ms < DEFAULT_LATENCY_MS
+    assert bandwidth_mbps > 0.0
+
+    # An unreachable peer still yields something the estimator can use.
+    assert await measure_peer_network(host_node.transport, "did:key:nobody") == (
+        DEFAULT_LATENCY_MS,
+        DEFAULT_BANDWIDTH_MBPS,
+    )
+
+    await host_node.transport.stop()
+    await worker_transport.stop()
+
+
+async def _resolve_probe_response(msg: AriesMessage, conn: PeerConnection) -> None:
+    """Stand-in for AriesNode._handle_inference_probe_response."""
+    from aries.inference.capability import _PENDING_PROBES
+
+    fut = _PENDING_PROBES.pop(msg.thread_id or "", None)
+    if fut is None or fut.done():
+        return
+    sent_ts = msg.body.get("ts")
+    fut.set_result(
+        (time.perf_counter() - float(sent_ts)) * 1000.0
+        if isinstance(sent_ts, (int, float))
+        else 0.0
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 23 — a measured link lands in the capability the estimator reads
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_peer_link_measurement_reaches_capability() -> None:
+    with tempfile.TemporaryDirectory() as tmp_a, tempfile.TemporaryDirectory() as tmp_b:
+        node_a = await _started_node(tmp_a, "box-a")
+        node_b = await _started_node(tmp_b, "box-b")
+        did_b = node_b.household.device_did or ""
+        try:
+            await node_a._connect_and_announce(
+                PeerInfo(
+                    device_did=did_b,
+                    name="box-b",
+                    host="127.0.0.1",
+                    port=node_b.transport.port,
+                    household_tag="",
+                )
+            )
+
+            assert await _wait_for(
+                lambda: did_b in node_a._local_inference_capability.peer_latency_ms
+            ), "link was never measured"
+
+            cap = node_a._local_inference_capability
+            assert cap.peer_latency_ms[did_b] >= 0.0
+            assert cap.peer_bandwidth_mbps[did_b] > 0.0
+
+            # Disconnecting forgets the link so a reconnect re-measures.
+            for conn in list(node_a.transport._connections.values()):
+                await conn.close()
+            assert await _wait_for(lambda: did_b not in cap.peer_latency_ms)
+        finally:
+            await node_a.stop()
+            await node_b.stop()

@@ -19,7 +19,7 @@ import shutil
 import struct
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 try:
     import psutil
@@ -101,57 +101,89 @@ async def probe_inference_capability(device_did: str, data_dir: Path) -> DeviceC
     )
 
 
-async def measure_peer_network(
-    transport: "TransportServer", peer_did: str, payload_size_bytes: int = 65536
-) -> tuple[float, float]:
-    """Send an INFERENCE_PROBE round-trip; return (latency_ms, bandwidth_mbps).
+DEFAULT_LATENCY_MS = 50.0
+DEFAULT_BANDWIDTH_MBPS = 100.0
+PROBE_TIMEOUT_S = 5.0
 
-    The probe is two messages: a tiny one to measure RTT, then a larger one to
-    estimate sustained throughput. If anything fails, returns generous defaults
-    so the registry still works with conservative estimates.
-    """
+# A Noise transport message caps at 65535 bytes *including* its 16-byte tag, so
+# an oversized probe raises inside encrypt() rather than crossing the wire. The
+# previous 64 KiB default did exactly that on every encrypted link, and the
+# failure was swallowed — bandwidth silently came back as the default forever.
+MAX_PROBE_PAYLOAD = 48 * 1024
+
+
+async def _probe_once(
+    conn: Any, sender_did: str, payload: bytes, phase: str
+) -> Optional[float]:
+    """One INFERENCE_PROBE round trip. Returns RTT in ms, or None on failure."""
     # Local import avoids a transport → inference circular import at module load.
     from ..transport.peer import AriesMessage, MessageTypes
 
+    msg = AriesMessage(
+        type=MessageTypes.INFERENCE_PROBE,
+        sender_did=sender_did,
+        body={"phase": phase, "payload": payload, "ts": time.perf_counter()},
+    )
+    fut: asyncio.Future[float] = asyncio.get_running_loop().create_future()
+    _PENDING_PROBES[msg.id] = fut
+    try:
+        await conn.send(msg)
+        return await asyncio.wait_for(fut, timeout=PROBE_TIMEOUT_S)
+    except Exception:
+        return None
+    finally:
+        _PENDING_PROBES.pop(msg.id, None)
+
+
+async def measure_peer_network(
+    transport: "TransportServer",
+    peer_did: str,
+    payload_size_bytes: int = MAX_PROBE_PAYLOAD,
+    sender_did: str = "",
+    rounds: int = 4,
+) -> tuple[float, float]:
+    """Measure a peer link; return (latency_ms, bandwidth_mbps).
+
+    A tiny probe establishes the round-trip floor, then larger probes are timed
+    against it: the *extra* time a big payload takes over a small one is pure
+    serialization, so bandwidth is derived from the RTT difference rather than
+    from absolute round-trip time (which would fold in latency and understate a
+    fast link). The payload crosses the wire twice — out and echoed back — and
+    both directions are counted.
+
+    Rounds are scheduling-sensitive, so the best observed throughput is kept:
+    contention only ever makes a link look slower than it is.
+
+    On any failure this returns conservative defaults, so a link that cannot be
+    measured still scores as something plausible.
+    """
     conn = transport.get_peer(peer_did)
     if conn is None:
-        return 50.0, 100.0  # conservative defaults
+        return DEFAULT_LATENCY_MS, DEFAULT_BANDWIDTH_MBPS
 
-    # Step 1: small RTT probe
-    rtt_payload = b"ping"
-    rtt_msg = AriesMessage(
-        type=MessageTypes.INFERENCE_PROBE,
-        sender_did="",
-        body={"phase": "rtt", "payload": rtt_payload, "ts": time.perf_counter()},
-    )
-    fut: asyncio.Future[float] = asyncio.get_event_loop().create_future()
-    _PENDING_PROBES[rtt_msg.id] = fut
-    try:
-        await conn.send(rtt_msg)
-        latency_ms = await asyncio.wait_for(fut, timeout=5.0)
-    except (asyncio.TimeoutError, Exception):
-        _PENDING_PROBES.pop(rtt_msg.id, None)
-        return 50.0, 100.0
+    size = max(1024, min(payload_size_bytes, MAX_PROBE_PAYLOAD))
 
-    # Step 2: bandwidth probe
-    bw_payload = b"x" * payload_size_bytes
-    bw_msg = AriesMessage(
-        type=MessageTypes.INFERENCE_PROBE,
-        sender_did="",
-        body={"phase": "bw", "payload": bw_payload, "ts": time.perf_counter()},
-    )
-    fut2: asyncio.Future[float] = asyncio.get_event_loop().create_future()
-    _PENDING_PROBES[bw_msg.id] = fut2
-    started = time.perf_counter()
-    try:
-        await conn.send(bw_msg)
-        await asyncio.wait_for(fut2, timeout=10.0)
-    except (asyncio.TimeoutError, Exception):
-        _PENDING_PROBES.pop(bw_msg.id, None)
-        return latency_ms, 100.0
-    elapsed_s = time.perf_counter() - started
-    bandwidth_mbps = (payload_size_bytes * 8 / 1_000_000.0) / max(elapsed_s, 1e-6)
-    return latency_ms, bandwidth_mbps
+    latency_ms = await _probe_once(conn, sender_did, b"ping", "rtt")
+    if latency_ms is None:
+        return DEFAULT_LATENCY_MS, DEFAULT_BANDWIDTH_MBPS
+
+    payload = b"x" * size
+    best_mbps = 0.0
+    for _ in range(max(rounds, 1)):
+        loaded_rtt_ms = await _probe_once(conn, sender_did, payload, "bw")
+        if loaded_rtt_ms is None:
+            break
+        delta_ms = loaded_rtt_ms - latency_ms
+        if delta_ms <= 0.05:
+            # Too fast to separate from the latency floor (loopback, or a probe
+            # dwarfed by the link). No usable throughput reading from this round.
+            continue
+        mbps = (size * 2 * 8 / 1_000_000.0) / (delta_ms / 1000.0)
+        best_mbps = max(best_mbps, mbps)
+
+    if best_mbps <= 0.0:
+        return latency_ms, DEFAULT_BANDWIDTH_MBPS
+    return latency_ms, best_mbps
 
 
 # Shared with node.py's _handle_inference_probe_response so callers can await.

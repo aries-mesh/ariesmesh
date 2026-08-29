@@ -8,8 +8,9 @@ import asyncio
 
 import pytest
 
+from aries.identity.did import public_key_to_did
 from aries.identity.keys import KeyPair
-from aries.transport.crypto import NoiseSession
+from aries.transport.crypto import NoiseSession, did_matches_static
 from aries.transport.peer import AriesMessage, MessageTypes, PeerConnection, PeerInfo, TransportServer
 
 
@@ -161,6 +162,8 @@ async def test_wrong_static_key_handshake_fails() -> None:
 async def test_peer_connection_encrypted_send_recv() -> None:
     kp_server = KeyPair.generate()
     kp_client = KeyPair.generate()
+    server_did = public_key_to_did(kp_server.public_bytes)
+    client_did = public_key_to_did(kp_client.public_bytes)
 
     server = TransportServer(device_keypair=kp_server)
     await server.start()
@@ -171,7 +174,7 @@ async def test_peer_connection_encrypted_send_recv() -> None:
         received.append(msg)
         reply = AriesMessage(
             type=MessageTypes.ACK,
-            sender_did="server",
+            sender_did=server_did,
             body={"echo": msg.body.get("text", "")},
         )
         await conn.send(reply)
@@ -179,7 +182,7 @@ async def test_peer_connection_encrypted_send_recv() -> None:
     server.on_message(MessageTypes.INVOKE, _echo)
 
     client_peer = PeerInfo(
-        device_did="server",
+        device_did=server_did,
         name="server",
         host="127.0.0.1",
         port=server.port,
@@ -194,7 +197,7 @@ async def test_peer_connection_encrypted_send_recv() -> None:
 
     msg = AriesMessage(
         type=MessageTypes.INVOKE,
-        sender_did="client",
+        sender_did=client_did,
         body={"text": "hello encrypted world"},
     )
     await client_conn.send(msg)
@@ -207,7 +210,7 @@ async def test_peer_connection_encrypted_send_recv() -> None:
 
     assert received, "Server did not receive the encrypted message"
     assert received[0].body["text"] == "hello encrypted world"
-    assert received[0].sender_did == "client"
+    assert received[0].sender_did == client_did
 
     await server.stop()
 
@@ -235,3 +238,99 @@ async def test_forward_secrecy_different_sessions() -> None:
     assert ct1 != ct2, (
         "Two separate sessions must produce different ciphertexts for the same plaintext"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 7: a DID is only valid if the handshake key backs it
+# ---------------------------------------------------------------------------
+
+def test_did_matches_static_binds_did_to_key() -> None:
+    kp = KeyPair.generate()
+    did = public_key_to_did(kp.public_bytes)
+
+    assert did_matches_static(did, bytes(kp.to_x25519_public()))
+    # Someone else's key does not satisfy this DID.
+    assert not did_matches_static(did, bytes(KeyPair.generate().to_x25519_public()))
+    # A malformed identifier must fail closed, not sail through.
+    assert not did_matches_static("not-a-did", bytes(kp.to_x25519_public()))
+
+
+# ---------------------------------------------------------------------------
+# Test 8: connecting to a peer advertising a DID it cannot back is refused
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_connect_rejects_advertised_did_mismatch() -> None:
+    """mDNS says a DID lives at this address; the key exchanged says otherwise."""
+    kp_server = KeyPair.generate()
+    kp_client = KeyPair.generate()
+    # A DID belonging to some third device — the server cannot hold its key.
+    impersonated_did = public_key_to_did(KeyPair.generate().public_bytes)
+
+    server = TransportServer(device_keypair=kp_server)
+    await server.start()
+    client_transport = TransportServer(device_keypair=kp_client)
+
+    peer = PeerInfo(
+        device_did=impersonated_did,
+        name="imposter",
+        host="127.0.0.1",
+        port=server.port,
+        household_tag="",
+    )
+    with pytest.raises(ConnectionError):
+        await client_transport.connect_to_peer(peer)
+
+    await server.stop()
+
+
+# ---------------------------------------------------------------------------
+# Test 9: an inbound peer cannot speak as one of its household siblings
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_inbound_spoofed_sender_did_is_dropped() -> None:
+    kp_server = KeyPair.generate()
+    kp_client = KeyPair.generate()
+    server_did = public_key_to_did(kp_server.public_bytes)
+    # The client holds kp_client but will claim to be this other device.
+    victim_did = public_key_to_did(KeyPair.generate().public_bytes)
+
+    server = TransportServer(device_keypair=kp_server)
+    await server.start()
+
+    received: list[AriesMessage] = []
+
+    async def _capture(msg: AriesMessage, conn: PeerConnection) -> None:
+        received.append(msg)
+
+    server.on_message(MessageTypes.INVOKE, _capture)
+
+    client_transport = TransportServer(device_keypair=kp_client)
+    conn = await client_transport.connect_to_peer(
+        PeerInfo(
+            device_did=server_did,
+            name="server",
+            host="127.0.0.1",
+            port=server.port,
+            household_tag="",
+        )
+    )
+
+    await conn.send(
+        AriesMessage(
+            type=MessageTypes.INVOKE,
+            sender_did=victim_did,
+            body={"text": "I am totally the other laptop"},
+        )
+    )
+
+    for _ in range(20):
+        await asyncio.sleep(0.05)
+        if received:
+            break
+
+    assert not received, "spoofed message reached a handler"
+    assert victim_did not in server._connections, "spoofed DID was registered"
+
+    await server.stop()

@@ -25,7 +25,11 @@ from .api.server import DashboardAPI
 from .continuation import Continuation, HandoffReason, build_continuation
 from .identity.household import AgentRecord, Household
 from .identity.keys import KeyPair
-from .inference.capability import _PENDING_PROBES, probe_inference_capability
+from .inference.capability import (
+    _PENDING_PROBES,
+    measure_peer_network,
+    probe_inference_capability,
+)
 from .inference.coordinator import InferenceCoordinator
 from .inference.registry import DeviceCapability, InferenceConfig, InferenceRegistry
 from .memory.store import MemoryStore
@@ -66,6 +70,7 @@ class AriesNode:
         self._inference_ready_futures: dict[str, asyncio.Future[bool]] = {}
         self._inference_rpc_processes: dict[str, "asyncio.subprocess.Process"] = {}
         self._local_inference_capability: Optional[DeviceCapability] = None
+        self._link_probe_tasks: set[asyncio.Task[None]] = set()
 
         # Live dashboard (Phase 4). Set by `aries start` when the dashboard
         # is active; left as None otherwise.
@@ -177,6 +182,10 @@ class AriesNode:
             # Probing must never block daemon startup.
             self._local_inference_capability = None
 
+        self.transport.on_disconnect(self._on_peer_disconnected)
+        self.transport.on_message(
+            MessageTypes.INFERENCE_CAPABILITY, self._handle_inference_capability
+        )
         self.transport.on_message(MessageTypes.INFERENCE_SETUP, self._handle_inference_setup)
         self.transport.on_message(MessageTypes.INFERENCE_READY, self._handle_inference_ready)
         self.transport.on_message(MessageTypes.INFERENCE_TEARDOWN, self._handle_inference_teardown)
@@ -200,6 +209,11 @@ class AriesNode:
                 self._api = None
 
     async def stop(self) -> None:
+        for task in list(self._link_probe_tasks):
+            task.cancel()
+        if self._link_probe_tasks:
+            await asyncio.gather(*self._link_probe_tasks, return_exceptions=True)
+            self._link_probe_tasks.clear()
         for component in (self._api, self.sync, self.profiler, self.discovery, self.transport):
             if component is None:
                 continue
@@ -292,10 +306,24 @@ class AriesNode:
         locality: Locality = Locality.HOUSEHOLD,
         tags: Optional[list[str]] = None,
         max_cost_class: str = "paid",
+        max_tokens: int = 4096,
         stream: bool = False,
+        inference_config: Optional[InferenceConfig] = None,
     ) -> InvokeResponse:
         if self.household is None or self.scheduler is None:
             raise RuntimeError("Node not initialized")
+
+        # An explicitly pinned configuration wins over every routing decision — a
+        # caller that already chose one (`aries inference run --model`) must not
+        # have the scheduler quietly pick something else.
+        if inference_config is not None:
+            return await self._invoke_distributed(
+                messages,
+                inference_config,
+                system_prompt=system_prompt,
+                max_tokens=max_tokens,
+                stream=stream,
+            )
 
         # Consider distributed inference configs alongside single-agent routing.
         # Only when the caller hasn't pinned a specific agent.
@@ -313,7 +341,11 @@ class AriesNode:
             if best is not None and best.config_type == "distributed":
                 try:
                     return await self._invoke_distributed(
-                        messages, best, system_prompt=system_prompt, stream=stream
+                        messages,
+                        best,
+                        system_prompt=system_prompt,
+                        max_tokens=max_tokens,
+                        stream=stream,
                     )
                 except RuntimeError:
                     # llama-server unavailable or setup failed — fall through
@@ -355,7 +387,9 @@ class AriesNode:
                 ucan_token=ucan_token,
             )
 
-        req = InvokeRequest(messages=list(messages), system_prompt=system_prompt)
+        req = InvokeRequest(
+            messages=list(messages), system_prompt=system_prompt, max_tokens=max_tokens
+        )
         start = time.perf_counter()
         response = await adapter.invoke(req)
         elapsed = (time.perf_counter() - start) * 1000.0
@@ -681,6 +715,7 @@ class AriesNode:
         config: InferenceConfig,
         *,
         system_prompt: Optional[str] = None,
+        max_tokens: int = 4096,
         stream: bool = False,
     ) -> InvokeResponse:
         """Run inference via llama.cpp RPC across the mesh.
@@ -707,6 +742,7 @@ class AriesNode:
             async for token in coordinator.generate(
                 prompt=prompt,
                 system_prompt=system_prompt,
+                max_tokens=max_tokens,
                 stream=stream,
             ):
                 chunks.append(token)
@@ -993,6 +1029,124 @@ class AriesNode:
     # inference message handlers (Feature 2)
     # -----------------------------------------------------------------------
 
+    def _capability_message(self, reply: bool) -> Optional[AriesMessage]:
+        """Envelope carrying this device's inference capability, or None if unprobed."""
+        if self._local_inference_capability is None:
+            return None
+        return AriesMessage(
+            type=MessageTypes.INFERENCE_CAPABILITY,
+            sender_did=(self.household.device_did or "") if self.household else "",
+            body={
+                "capability": self._local_inference_capability.to_dict(),
+                "reply": reply,
+            },
+        )
+
+    async def _handle_inference_capability(
+        self, msg: AriesMessage, conn: PeerConnection
+    ) -> None:
+        """Register a peer's inference capability so distributed configs can form.
+
+        Without this the registry only ever holds the local device, every worker
+        loop in `_compute_configs` runs zero iterations, and no distributed
+        configuration is ever produced no matter how many peers are connected.
+
+        `reply=True` marks an unsolicited push, which we answer once with our own
+        capability and `reply=False` — so a connection converges after exactly one
+        round trip instead of ping-ponging forever.
+        """
+        if self._inference_registry is None:
+            return
+        raw = msg.body.get("capability")
+        if not isinstance(raw, dict):
+            return
+        try:
+            capability = DeviceCapability.from_dict(raw)
+        except (KeyError, TypeError, ValueError):
+            return
+
+        # Identify the peer by the DID the transport authenticated against its
+        # handshake key, never by the device_did it wrote into its own payload.
+        sender = msg.sender_did or conn.peer.device_did
+        if not sender:
+            return
+        capability.device_did = sender
+        for model in capability.available_models:
+            model.device_did = sender
+        self._inference_registry.update_device(sender, capability)
+        self._emit_event(
+            "inference_capability",
+            f"Capability from {sender[:16]}...: "
+            f"{len(capability.available_models)} model(s), "
+            f"{capability.ram_available_gb:.1f} GB free",
+        )
+
+        if msg.body.get("reply"):
+            reply_msg = self._capability_message(reply=False)
+            if reply_msg is not None:
+                try:
+                    await conn.send(reply_msg)
+                except Exception:
+                    pass
+
+        # Now that the peer is authenticated and known to do inference, find out
+        # what the link between us actually looks like.
+        self._schedule_link_measurement(sender)
+
+    def _schedule_link_measurement(self, peer_did: str) -> None:
+        """Measure a peer link in the background, once per connection."""
+        cap = self._local_inference_capability
+        if cap is None or not peer_did or peer_did in cap.peer_latency_ms:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._measure_peer_link(peer_did))
+        self._link_probe_tasks.add(task)
+        task.add_done_callback(self._link_probe_tasks.discard)
+
+    async def _measure_peer_link(self, peer_did: str) -> None:
+        """Fold a measured RTT / throughput for ``peer_did`` into our capability.
+
+        `_build_distributed_config` reads these numbers to estimate distributed
+        throughput. Unmeasured, every link scores as 50 ms / 100 Mbps, which
+        misrepresents gigabit ethernet and congested WiFi in opposite directions.
+        """
+        if self.transport is None or self._local_inference_capability is None:
+            return
+        try:
+            latency_ms, bandwidth_mbps = await measure_peer_network(
+                self.transport,
+                peer_did,
+                sender_did=(self.household.device_did or "") if self.household else "",
+            )
+        except Exception:
+            return
+
+        cap = self._local_inference_capability
+        cap.peer_latency_ms[peer_did] = latency_ms
+        cap.peer_bandwidth_mbps[peer_did] = bandwidth_mbps
+        if self._inference_registry is not None and self.household is not None:
+            # Re-register ourselves so configs re-estimate with the real numbers.
+            self._inference_registry.update_device(self.household.device_did or "", cap)
+        self._emit_event(
+            "peer_link_measured",
+            f"Link to {peer_did[:16]}...: {latency_ms:.1f} ms, {bandwidth_mbps:.0f} Mbps",
+        )
+
+    def _on_peer_disconnected(self, device_did: str) -> None:
+        """Drop a departed peer's capability so stale configs stop being offered."""
+        if self._inference_registry is not None and device_did:
+            self._inference_registry.remove_device(device_did)
+        cap = self._local_inference_capability
+        if cap is not None and device_did:
+            # Forget the link too, so a reconnect re-measures instead of scoring
+            # against numbers from a session that may have been on another network.
+            cap.peer_latency_ms.pop(device_did, None)
+            cap.peer_bandwidth_mbps.pop(device_did, None)
+        self._emit_event("peer_disconnect", f"Peer disconnected: {device_did[:16]}...")
+
     async def _handle_inference_setup(self, msg: AriesMessage, conn: PeerConnection) -> None:
         """A peer is asking this node to start an rpc-server for distributed inference."""
         if self.household is None:
@@ -1174,6 +1328,18 @@ class AriesNode:
             await conn.send(announce)
         except Exception:
             return
+
+        # Trade inference capabilities so both sides can compute distributed
+        # configurations. ponytail: exchanged once per connection — a device that
+        # frees a lot of memory mid-session isn't re-evaluated until it reconnects.
+        # Re-send on a capability delta if that becomes a real limitation.
+        capability_msg = self._capability_message(reply=True)
+        if capability_msg is not None:
+            try:
+                await conn.send(capability_msg)
+            except Exception:
+                pass
+
         if self.sync is not None:
             await self.sync.sync_with_peer(conn)
 

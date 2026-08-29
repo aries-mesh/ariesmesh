@@ -7,8 +7,10 @@ from __future__ import annotations
 import asyncio
 import json
 import platform as _platform
+import statistics
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, AsyncIterator, Callable, Optional
 
 import click
 from rich.console import Console
@@ -16,7 +18,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.tree import Tree
 
-from ..adapters.base import Message
+from ..adapters.base import BaseAdapter, InvokeRequest, Message
 from ..adapters.litellm_adapter import (
     anthropic_adapter,
     custom_adapter,
@@ -25,7 +27,9 @@ from ..adapters.litellm_adapter import (
     openai_adapter,
 )
 from ..adapters.mock_adapter import MockAdapter
-from ..identity.household import Household
+from ..identity.household import AgentRecord, Household
+from ..inference.coordinator import InferenceCoordinator
+from ..inference.registry import InferenceConfig
 from ..memory.store import MemoryStore
 from ..node import AriesNode
 from ..scheduler.profile import DeviceProfiler
@@ -34,6 +38,9 @@ from ..scheduler.router import load_mandates_from_yaml
 
 console = Console()
 DEFAULT_DATA_DIR = "~/.aries"
+# How long the inference commands wait for mDNS discovery plus the capability
+# exchange before concluding a model has no configuration.
+PEER_SETTLE_S = 10.0
 
 
 def run_async(coro):
@@ -597,10 +604,9 @@ def invoke(
         node = AriesNode(data_dir=ctx.obj["data_dir"])
         await node.start()
         try:
-            # Re-attach mock adapters transparently (same convenience as before).
-            for did, rec in node.household.agents.items():  # type: ignore[union-attr]
-                if rec.vendor == "mock" and did not in node._adapters:
-                    node.attach_adapter(did, MockAdapter(model=rec.model or "mock-1"))
+            # Agent records outlive the process; their adapters don't. Rebuild
+            # whatever we can so a registered agent is actually callable.
+            _reattach_adapters(node)
 
             msgs = [Message(role="user", content=message)]
             kwargs = dict(
@@ -666,56 +672,250 @@ def inference(ctx: click.Context) -> None:
     pass
 
 
+async def _await_peer_capabilities(node: AriesNode, wait_s: float = PEER_SETTLE_S) -> int:
+    """Give peers a chance to publish capabilities; return how many devices we know.
+
+    Returns as soon as any peer has answered, so the common case doesn't pay the
+    full window. A solo device waits it out once.
+    """
+    registry = node._inference_registry
+    if registry is None:
+        return 0
+    deadline = time.perf_counter() + max(wait_s, 0.0)
+    while time.perf_counter() < deadline:
+        if len(registry._device_capabilities) > 1:
+            break
+        await asyncio.sleep(0.25)
+    return len(registry._device_capabilities)
+
+
 @inference.command("status")
 @click.pass_context
 def inference_status(ctx: click.Context) -> None:
-    """Show all currently-feasible inference configurations."""
-    from ..inference.capability import probe_inference_capability
-    from ..inference.registry import InferenceRegistry
+    """Show all currently-feasible inference configurations across the mesh."""
 
     async def _go() -> None:
-        h = Household(data_dir=ctx.obj["data_dir"])
-        if not h.is_initialized:
-            console.print("[red]Household not initialized.[/red]")
-            return
-        h.load()
-        registry = InferenceRegistry()
-        local_cap = await probe_inference_capability(
-            h.device_did or "", Path(ctx.obj["data_dir"]).expanduser()
-        )
-        registry.update_device(h.device_did or "", local_cap)
-        configs = registry.get_configs()
+        node = AriesNode(data_dir=ctx.obj["data_dir"])
+        # A full node, not a bare probe: distributed configurations only exist
+        # once peers have connected and published what they can contribute.
+        await node.start(enable_api=False)
+        try:
+            console.print("[dim]Scanning the mesh...[/dim]")
+            devices = await _await_peer_capabilities(node)
+            local_cap = node._local_inference_capability
+            registry = node._inference_registry
+            configs = registry.get_configs() if registry is not None else []
 
-        if not configs:
-            console.print(
-                Panel.fit(
-                    f"No inference configurations available.\n\n"
-                    f"llama.cpp on this device: "
-                    f"{'yes' if local_cap.llama_cpp_available else 'no'}\n"
-                    f"Models discovered:        {len(local_cap.available_models)}\n"
-                    f"Backend:                  {local_cap.backend}\n",
-                    title="aries inference status",
+            if not configs:
+                console.print(
+                    Panel.fit(
+                        f"No inference configurations available.\n\n"
+                        f"llama.cpp on this device: "
+                        f"{'yes' if local_cap and local_cap.llama_cpp_available else 'no'}\n"
+                        f"Models discovered:        "
+                        f"{len(local_cap.available_models) if local_cap else 0}\n"
+                        f"Backend:                  "
+                        f"{local_cap.backend if local_cap else 'unknown'}\n"
+                        f"Devices published:        {devices}\n\n"
+                        f"Put GGUF files in ~/.aries/models and make sure "
+                        f"llama-server is on PATH.",
+                        title="aries inference status",
+                    )
                 )
-            )
-            return
+                return
 
-        table = Table(title="Inference configurations")
-        table.add_column("Model", style="bold")
-        table.add_column("Type")
-        table.add_column("Devices")
-        table.add_column("Est. tok/s")
-        table.add_column("Score", justify="right")
-        for c in configs:
-            table.add_row(
-                c.model_name,
-                c.config_type,
-                ",".join(d.device_did[:10] for d in c.devices),
-                f"{c.estimated_tok_s:.1f}",
-                f"{c.weighted_score():.2f}",
+            table = Table(
+                title="Inference configurations",
+                caption=f"{devices} device(s) publishing capabilities",
             )
-        console.print(table)
+            table.add_column("Model", style="bold")
+            table.add_column("Type")
+            table.add_column("Devices")
+            table.add_column("Est. tok/s")
+            table.add_column("Score", justify="right")
+            for c in sorted(configs, key=lambda c: c.weighted_score(), reverse=True):
+                table.add_row(
+                    c.model_name,
+                    c.config_type,
+                    ",".join(d.device_did[:10] for d in c.devices),
+                    f"{c.estimated_tok_s:.1f}",
+                    f"{c.weighted_score():.2f}",
+                )
+            console.print(table)
+        finally:
+            await node.stop()
 
     run_async(_go())
+
+
+async def _resolve_inference_config(
+    node: AriesNode, model: str, wait_s: float = PEER_SETTLE_S
+) -> Optional[InferenceConfig]:
+    """Best-scoring configuration for ``model``, or None having explained why.
+
+    Waits up to ``wait_s`` for peers to appear. A node that just started knows
+    only its own hardware; a distributed configuration cannot exist until mDNS
+    has found a peer and that peer has answered with its capability, which is
+    a couple of round trips after `start()` returns.
+    """
+    registry = node._inference_registry
+    if registry is None:
+        console.print("[red]Inference registry not initialized.[/red]")
+        return None
+
+    deadline = time.perf_counter() + max(wait_s, 0.0)
+    waited = False
+    while True:
+        configs = [c for c in registry.get_configs() if c.model_name == model]
+        if configs:
+            return max(configs, key=lambda c: c.weighted_score())
+        if time.perf_counter() >= deadline:
+            break
+        if not waited:
+            console.print("[dim]Waiting for peers to publish their capabilities...[/dim]")
+            waited = True
+        await asyncio.sleep(0.25)
+
+    console.print(
+        f"[red]No configuration for model {model!r}.[/red] "
+        f"[dim]`aries inference status` lists what this device can see.[/dim]"
+    )
+    peers = len(node.transport.connected_peers()) if node.transport is not None else 0
+    if peers == 0:
+        console.print(
+            "[dim]No peers are connected, so only single-device configurations "
+            "are possible. Pair a second device, or use `aries connect <ip:port>` "
+            "if mDNS is unavailable.[/dim]"
+        )
+    return None
+
+
+def _report_inference_failure(exc: Exception) -> None:
+    """Both inference commands name a model explicitly, so quietly falling back
+    to whatever else the scheduler likes would answer a different question."""
+    console.print(f"[red]{exc}[/red]")
+    console.print(
+        "[dim]Hint: install llama.cpp so `llama-server` is on PATH, "
+        "or use `aries invoke` to let the scheduler choose.[/dim]"
+    )
+
+
+def _adapter_from_record(rec: AgentRecord) -> Optional[BaseAdapter]:
+    """Rebuild a live adapter for a persisted agent record.
+
+    Agent records survive restarts but adapter instances do not, so a fresh
+    process holds records it has no way to call. Vendors whose credentials live
+    in the environment rebuild cleanly — litellm reads ANTHROPIC_API_KEY /
+    OPENAI_API_KEY / GEMINI_API_KEY itself when no key is passed. Returns None
+    for `openai-compatible`, whose api_base was never persisted.
+    """
+    model = rec.model or ""
+    if rec.vendor == "mock":
+        return MockAdapter(model=model or "mock-1")
+    if rec.vendor == "ollama":
+        return ollama_adapter(model=model)
+    if rec.vendor == "anthropic":
+        return anthropic_adapter(model=model)
+    if rec.vendor == "openai":
+        return openai_adapter(model=model)
+    if rec.vendor == "google":
+        return google_adapter(model=model)
+    return None
+
+
+def _reattach_adapters(node: AriesNode) -> None:
+    """Give every reconstructable agent record a live adapter on this node."""
+    if node.household is None:
+        return
+    for did, rec in node.household.agents.items():
+        if did in node._adapters:
+            continue
+        adapter = _adapter_from_record(rec)
+        if adapter is not None:
+            node.attach_adapter(did, adapter)
+
+
+def _find_agent(node: AriesNode, needle: str) -> Optional[AgentRecord]:
+    """Look an agent up by exact name, exact DID, or DID prefix."""
+    if node.household is not None:
+        for rec in node.household.agents.values():
+            if needle in (rec.name, rec.agent_did) or rec.agent_did.startswith(needle):
+                return rec
+    console.print(f"[red]No registered agent matching {needle!r}. Try `aries agents`.[/red]")
+    return None
+
+
+async def _timed_runs(
+    make_stream: Callable[[], AsyncIterator[str]],
+    runs: int,
+    warmup: int,
+) -> list[dict[str, float]]:
+    """Drive a token stream `warmup + runs` times, timing only the measured runs.
+
+    Per run it records:
+      ``ttft_s``        request start → first token (prefill + any setup on the
+                        request path; model load is deliberately hoisted out by
+                        the caller so it lands in warmup, not here)
+      ``decode_tok_s``  (n-1) / (last token − first token). Excluding prefill is
+                        what makes this comparable across arms — a distributed
+                        run pays its network cost per decoded token, and folding
+                        prefill in would dilute exactly the effect under test.
+      ``total_s``       request start → last token
+    """
+    records: list[dict[str, float]] = []
+    for i in range(warmup + runs):
+        started = time.perf_counter()
+        first_at: Optional[float] = None
+        n = 0
+        async for _token in make_stream():
+            if first_at is None:
+                first_at = time.perf_counter()
+            n += 1
+        ended = time.perf_counter()
+
+        if i < warmup:
+            console.print(f"  [dim]warmup {i + 1}/{warmup}: {n} tokens[/dim]")
+            continue
+        if n == 0 or first_at is None:
+            console.print("  [yellow]run produced no tokens; excluded[/yellow]")
+            continue
+
+        decode_s = ended - first_at
+        rec = {
+            "ttft_s": first_at - started,
+            "decode_tok_s": (n - 1) / decode_s if n > 1 and decode_s > 0 else 0.0,
+            "total_s": ended - started,
+            "tokens": float(n),
+        }
+        records.append(rec)
+        console.print(
+            f"  run {i - warmup + 1}/{runs}: {rec['decode_tok_s']:.2f} tok/s · "
+            f"{rec['ttft_s'] * 1000:.0f} ms TTFT · {n} tokens"
+        )
+    return records
+
+
+def _report_runs(title: str, caption: str, records: list[dict[str, float]]) -> None:
+    if not records:
+        console.print("[yellow]No successful runs; nothing to report.[/yellow]")
+        return
+
+    def stats(key: str) -> tuple[float, float]:
+        xs = sorted(r[key] for r in records)
+        return statistics.median(xs), xs[min(int(len(xs) * 0.95), len(xs) - 1)]
+
+    table = Table(title=title, caption=caption)
+    table.add_column("Metric")
+    table.add_column("Median", justify="right")
+    table.add_column("p95", justify="right")
+    tok_med, tok_p95 = stats("decode_tok_s")
+    ttft_med, ttft_p95 = stats("ttft_s")
+    total_med, total_p95 = stats("total_s")
+    table.add_row("decode tok/s", f"{tok_med:.2f}", f"{tok_p95:.2f}")
+    table.add_row("TTFT (ms)", f"{ttft_med * 1000:.0f}", f"{ttft_p95 * 1000:.0f}")
+    table.add_row("total (s)", f"{total_med:.2f}", f"{total_p95:.2f}")
+    table.add_row("tokens", f"{statistics.median([r['tokens'] for r in records]):.0f}", "")
+    console.print(table)
 
 
 @inference.command("run")
@@ -732,26 +932,23 @@ def inference_run(
         node = AriesNode(data_dir=ctx.obj["data_dir"])
         await node.start()
         try:
-            registry = node._inference_registry
-            if registry is None:
-                console.print("[red]Inference registry not initialized.[/red]")
+            best = await _resolve_inference_config(node, model)
+            if best is None:
                 return
-            configs = [c for c in registry.get_configs() if c.model_name == model]
-            if not configs:
-                console.print(
-                    f"[red]No configuration for model {model!r}. "
-                    f"Run `aries inference status` to see available models.[/red]"
-                )
-                return
-            best = max(configs, key=lambda c: c.weighted_score())
             console.print(
                 f"Running {model} via [bold]{best.config_type}[/bold] "
                 f"(estimated {best.estimated_tok_s:.1f} tok/s)"
             )
-            resp = await node.invoke(
-                messages=[Message(role="user", content=prompt)],
-                stream=stream,
-            )
+            try:
+                resp = await node.invoke(
+                    messages=[Message(role="user", content=prompt)],
+                    inference_config=best,
+                    max_tokens=max_tokens,
+                    stream=stream,
+                )
+            except RuntimeError as exc:
+                _report_inference_failure(exc)
+                return
             console.print(
                 Panel.fit(resp.content, title=f"{resp.model} ({resp.latency_ms:.0f} ms)")
             )
@@ -762,50 +959,120 @@ def inference_run(
 
 
 @inference.command("benchmark")
-@click.option("--model", required=True)
-@click.option("--prompt-tokens", default=128)
-@click.option("--gen-tokens", default=64)
-@click.option("--runs", default=5)
+@click.option("--model", default=None, help="GGUF model name (a local or distributed config)")
+@click.option(
+    "--agent",
+    default=None,
+    help="Registered agent name or DID instead of --model (e.g. a cloud model)",
+)
+@click.option("--prompt-tokens", default=128, help="Approximate prompt length in tokens")
+@click.option("--gen-tokens", default=64, help="Token budget per run")
+@click.option("--runs", default=5, help="Measured runs")
+@click.option(
+    "--warmup",
+    default=1,
+    help="Untimed runs first, so cache-warming doesn't land in the medians.",
+)
 @click.pass_context
 def inference_benchmark(
-    ctx: click.Context, model: str, prompt_tokens: int, gen_tokens: int, runs: int
+    ctx: click.Context,
+    model: Optional[str],
+    agent: Optional[str],
+    prompt_tokens: int,
+    gen_tokens: int,
+    runs: int,
+    warmup: int,
 ) -> None:
-    """Benchmark inference for a given model across ``--runs`` iterations."""
-    import statistics
-    import time
+    """Measure decode throughput and TTFT for one execution mode.
+
+    Exactly one of --model (a GGUF config, local or distributed) or --agent (a
+    registered adapter, including cloud) selects what to measure. Both arms are
+    driven through the same streaming timer, so their numbers are comparable.
+
+    Model loading happens once, before the timed runs — a benchmark that reloads
+    weights per iteration measures disk, not inference.
+    """
+    if bool(model) == bool(agent):
+        console.print("[red]Pass exactly one of --model or --agent.[/red]")
+        raise click.Abort()
+    if runs < 1:
+        console.print("[red]--runs must be at least 1.[/red]")
+        raise click.Abort()
 
     async def _go() -> None:
         node = AriesNode(data_dir=ctx.obj["data_dir"])
         await node.start()
+        prompt = " ".join(["benchmark"] * prompt_tokens)
+        caption = (
+            f"n={runs} (+{warmup} warmup) · ~{prompt_tokens} prompt tokens · "
+            f"{gen_tokens} token budget"
+        )
         try:
-            tok_per_s: list[float] = []
-            ttfts: list[float] = []
-            prompt = " ".join(["benchmark"] * prompt_tokens)
-            for i in range(runs):
-                start = time.perf_counter()
-                resp = await node.invoke(
-                    messages=[Message(role="user", content=prompt)],
-                    stream=False,
+            if model:
+                config = await _resolve_inference_config(node, model)
+                if config is None:
+                    return
+                devices = len(config.devices)
+                console.print(
+                    f"Benchmarking [bold]{model}[/bold] via {config.config_type} "
+                    f"across {devices} device(s) — loading weights..."
                 )
-                elapsed = time.perf_counter() - start
-                total_tokens = max(int(resp.usage.get("completion_tokens", gen_tokens)), 1)
-                tok_per_s.append(total_tokens / elapsed)
-                ttfts.append(resp.latency_ms / 1000.0)
-                console.print(f"  run {i+1}/{runs}: {tok_per_s[-1]:.2f} tok/s")
+                coordinator = InferenceCoordinator(node=node, config=config)
+                if not await coordinator.setup():
+                    console.print(
+                        f"[red]Inference setup failed for config {config.config_id}.[/red]"
+                    )
+                    return
+                try:
+                    records = await _timed_runs(
+                        lambda: coordinator.generate(
+                            prompt=prompt, max_tokens=gen_tokens, stream=True
+                        ),
+                        runs,
+                        warmup,
+                    )
+                except RuntimeError as exc:
+                    _report_inference_failure(exc)
+                    return
+                finally:
+                    await coordinator.teardown()
+                _report_runs(
+                    f"{model} — {config.config_type} ({devices} device(s))", caption, records
+                )
+                return
 
-            table = Table(title=f"Benchmark — {model}")
-            table.add_column("Metric")
-            table.add_column("Median", justify="right")
-            table.add_column("p95", justify="right")
-            tok_per_s.sort()
-            ttfts.sort()
+            _reattach_adapters(node)
+            record = _find_agent(node, agent or "")
+            if record is None:
+                return
+            adapter = node._adapters.get(record.agent_did)
+            if adapter is None:
+                console.print(
+                    f"[red]Agent {record.name} ({record.vendor}) has no live adapter.[/red]"
+                )
+                console.print(
+                    "[dim]Cloud vendors read their key from the environment "
+                    "(ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY); "
+                    "openai-compatible agents can't be rebuilt because their "
+                    "--api-base was never persisted.[/dim]"
+                )
+                return
 
-            def p95(xs: list[float]) -> float:
-                return xs[min(int(len(xs) * 0.95), len(xs) - 1)]
-
-            table.add_row("tok/s", f"{statistics.median(tok_per_s):.2f}", f"{p95(tok_per_s):.2f}")
-            table.add_row("TTFT (s)", f"{statistics.median(ttfts):.2f}", f"{p95(ttfts):.2f}")
-            console.print(table)
+            console.print(
+                f"Benchmarking [bold]{record.name}[/bold] "
+                f"({record.vendor}/{record.model or '—'}, {record.locality})"
+            )
+            req = InvokeRequest(
+                messages=[Message(role="user", content=prompt)],
+                max_tokens=gen_tokens,
+                stream=True,
+            )
+            try:
+                records = await _timed_runs(lambda: adapter.invoke_stream(req), runs, warmup)
+            except (RuntimeError, ImportError) as exc:
+                console.print(f"[red]{exc}[/red]")
+                return
+            _report_runs(f"{record.name} — {record.locality}", caption, records)
         finally:
             await node.stop()
 
