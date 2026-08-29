@@ -58,6 +58,10 @@ class InferenceCoordinator:
 
         self._llama_process: Optional[asyncio.subprocess.Process] = None
         self._workers_ready: dict[str, bool] = {}
+        # `config.rpc_endpoints` carries worker DIDs as placeholders; the real
+        # host:port pairs are only knowable from live connections, so they are
+        # resolved during setup() and kept here.
+        self._rpc_endpoints: list[str] = []
         self._has_local_llama_server: bool = False
         self._active: bool = False
         self._health_task: Optional[asyncio.Task[None]] = None
@@ -69,6 +73,11 @@ class InferenceCoordinator:
     @property
     def workers_ready(self) -> dict[str, bool]:
         return dict(self._workers_ready)
+
+    @property
+    def resolved_rpc_endpoints(self) -> list[str]:
+        """Worker endpoints as `host:port`, populated by setup()."""
+        return list(self._rpc_endpoints)
 
     # ------------------------------------------------------------------ setup
 
@@ -89,6 +98,21 @@ class InferenceCoordinator:
             logger.warning("Distributed config %s has no worker roles", self.config.config_id)
             return False
 
+        # This node is the one that will run llama-server and read the GGUF off
+        # local disk, so it has to be the config's host. Now that peers publish
+        # their capabilities, the registry also builds configs hosted elsewhere —
+        # those are real, they just have to be driven from the other device.
+        host_role = next((r for r in self.config.devices if r.role == "host"), None)
+        local_did = (self.node.household.device_did or "") if self.node.household else ""
+        if host_role is not None and local_did and host_role.device_did != local_did:
+            logger.warning(
+                "Config %s is hosted by %s..., not this device — run it from there",
+                self.config.config_id,
+                host_role.device_did[:24],
+            )
+            return False
+
+        resolved: list[str] = []
         for role in workers:
             peer_conn = self.node.transport.get_peer(role.device_did)
             if peer_conn is None:
@@ -130,6 +154,19 @@ class InferenceCoordinator:
                 self.node._inference_ready_futures.pop(role.device_did, None)
                 return False
 
+            # A DID means nothing to llama.cpp — give it the address we are
+            # actually talking to this worker on.
+            worker_host = getattr(peer_conn.peer, "host", "") or ""
+            if not worker_host:
+                logger.warning(
+                    "No address known for worker %s; cannot build an RPC endpoint",
+                    role.device_did[:24],
+                )
+                return False
+            resolved.append(f"{worker_host}:{self._rpc_port}")
+
+        self._rpc_endpoints = resolved
+
         # Try to start llama-server locally (best-effort).
         self._has_local_llama_server = await self._maybe_start_llama_server()
 
@@ -159,8 +196,8 @@ class InferenceCoordinator:
             "--port", str(self._llama_port),
             "--host", self._llama_host,
         ]
-        if self.config.rpc_endpoints:
-            cmd += ["--rpc", ",".join(self.config.rpc_endpoints)]
+        if self._rpc_endpoints:
+            cmd += ["--rpc", ",".join(self._rpc_endpoints)]
         if self.config.tensor_split:
             cmd += ["--tensor-split", ",".join(f"{s:.3f}" for s in self.config.tensor_split)]
 
@@ -306,6 +343,7 @@ class InferenceCoordinator:
 
         self._active = False
         self._workers_ready.clear()
+        self._rpc_endpoints.clear()
 
     # ---------------------------------------------------------------- monitor
 

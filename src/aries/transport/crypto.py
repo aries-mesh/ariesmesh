@@ -15,9 +15,11 @@ import struct
 from typing import Optional
 
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+from nacl.signing import VerifyKey
 from noise.connection import Keypair as NKeypair
 from noise.connection import NoiseConnection
 
+from ..identity.did import did_to_public_key
 from ..identity.keys import KeyPair
 
 _PROTOCOL = b"Noise_XX_25519_ChaChaPoly_SHA256"
@@ -27,6 +29,22 @@ _APP_BYTE = b"\x01"
 
 class HandshakeError(Exception):
     """Raised when the Noise_XX handshake cannot be completed."""
+
+
+def did_matches_static(did: str, remote_static: bytes) -> bool:
+    """True if `remote_static` is the X25519 form of `did`'s Ed25519 key.
+
+    The handshake authenticates a static key but says nothing about which DID
+    owns it. This is the bridge: it converts the Ed25519 key embedded in a
+    did:key the same way `KeyPair.to_x25519_public()` converts ours, then
+    compares the raw bytes. A peer that cannot present the matching static key
+    cannot claim that DID.
+    """
+    try:
+        expected = bytes(VerifyKey(did_to_public_key(did)).to_curve25519_public_key())
+    except Exception:
+        return False
+    return expected == remote_static
 
 
 class NoiseSession:

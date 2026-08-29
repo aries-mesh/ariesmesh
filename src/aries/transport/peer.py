@@ -22,7 +22,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 import cbor2
 
-from .crypto import HandshakeError, NoiseSession, _APP_BYTE
+from .crypto import HandshakeError, NoiseSession, _APP_BYTE, did_matches_static
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,7 @@ class MessageTypes:
     PAIRING_ACCEPT = "aries/v0.1/pairing/accept"
 
     # Distributed inference (v0.2)
+    INFERENCE_CAPABILITY = "aries/v0.2/inference/capability"
     INFERENCE_SETUP = "aries/v0.2/inference/setup"
     INFERENCE_READY = "aries/v0.2/inference/ready"
     INFERENCE_TEARDOWN = "aries/v0.2/inference/teardown"
@@ -153,6 +154,9 @@ class PeerConnection:
         self._send_lock = asyncio.Lock()
         self._noise: Optional[NoiseSession] = None
         self._encrypted = False
+        # Static key the peer authenticated during the handshake. Every DID this
+        # connection claims is checked against it; None means no handshake ran.
+        self.remote_static: Optional[bytes] = None
 
     @property
     def is_connected(self) -> bool:
@@ -166,8 +170,20 @@ class PeerConnection:
         """
         self._noise = NoiseSession(device_keypair, is_initiator)
         remote_static = await self._noise.handshake(self.reader, self.writer)
+        self.remote_static = remote_static
         self._encrypted = True
         return remote_static
+
+    def verify_claimed_did(self, did: str) -> bool:
+        """True if `did` is backed by the static key authenticated at handshake.
+
+        Returns True when no handshake ran (`remote_static is None`) — that is
+        the plaintext path used by unit tests that build the transport without
+        a household, where there is no key to check against.
+        """
+        if self.remote_static is None:
+            return True
+        return did_matches_static(did, self.remote_static)
 
     async def send(self, msg: AriesMessage) -> None:
         if not self._connected:
@@ -228,9 +244,14 @@ class TransportServer:
         self._connections: dict[str, PeerConnection] = {}
         self._recv_tasks: set[asyncio.Task[None]] = set()
         self._device_keypair = device_keypair
+        self._on_disconnect: list[Callable[[str], None]] = []
 
     def on_message(self, msg_type: str, handler: MessageHandler) -> None:
         self._handlers[msg_type] = handler
+
+    def on_disconnect(self, cb: Callable[[str], None]) -> None:
+        """Register a callback fired with a peer's DID when its link drops."""
+        self._on_disconnect.append(cb)
 
     async def start(self) -> int:
         self._server = await asyncio.start_server(self._handle_connection, self.host, self.port)
@@ -266,6 +287,18 @@ class TransportServer:
             except HandshakeError as exc:
                 await conn.close()
                 raise ConnectionError(f"Noise handshake failed with {peer.name}: {exc}") from exc
+            # mDNS told us which DID lives here; make the peer prove it holds the
+            # matching key before we treat the connection as that identity.
+            if (
+                peer.device_did
+                and peer.device_did != "unknown"
+                and not conn.verify_claimed_did(peer.device_did)
+            ):
+                await conn.close()
+                raise ConnectionError(
+                    f"Peer at {peer.host}:{peer.port} presented a static key that does "
+                    f"not match its advertised DID {peer.device_did[:24]}..."
+                )
         if peer.device_did:
             self._connections[peer.device_did] = conn
         task = asyncio.create_task(self._receive_loop(conn))
@@ -321,9 +354,29 @@ class TransportServer:
                 msg = await conn.recv()
                 if msg is None:
                     break
-                if msg.sender_did and conn.peer.device_did == "unknown":
-                    conn.peer.device_did = msg.sender_did
-                    self._connections[msg.sender_did] = conn
+                if msg.sender_did:
+                    if conn.peer.device_did in ("", "unknown"):
+                        # Inbound connections learn the peer's DID from its first
+                        # signed message; bind it only if the handshake key backs it.
+                        if not conn.verify_claimed_did(msg.sender_did):
+                            logger.warning(
+                                "Peer at %s claimed DID %s... which its handshake key "
+                                "does not back; dropping connection",
+                                conn.peer.host,
+                                msg.sender_did[:24],
+                            )
+                            break
+                        conn.peer.device_did = msg.sender_did
+                        self._connections[msg.sender_did] = conn
+                    elif msg.sender_did != conn.peer.device_did:
+                        # Identity is pinned for the life of the connection — a peer
+                        # cannot start speaking as one of its household siblings.
+                        logger.warning(
+                            "Peer %s... sent a message as %s...; dropping connection",
+                            conn.peer.device_did[:24],
+                            msg.sender_did[:24],
+                        )
+                        break
                 handler = self._handlers.get(msg.type)
                 if handler is None:
                     continue
@@ -337,3 +390,9 @@ class TransportServer:
             did = conn.peer.device_did
             if did and self._connections.get(did) is conn:
                 self._connections.pop(did, None)
+                for cb in list(self._on_disconnect):
+                    try:
+                        cb(did)
+                    except Exception:
+                        # A bad listener must not leak out of connection teardown.
+                        pass
